@@ -58,6 +58,19 @@ REMOTE_PATHS = [
     "/sdcard/KakaoTalkDownload/",
 ]
 
+# 카카오톡 앱 캐시 경로 (채팅에서 받은 이미지 - 저장 버튼 없이 자동 저장)
+# BlueStacks에서는 Scoped Storage 제한이 완화되어 접근 가능
+KAKAO_CACHE_PATH = "/sdcard/Android/data/com.kakao.talk/contents/"
+
+# 이미지 파일 시그니처 (Magic bytes)
+IMAGE_SIGNATURES = {
+    b'\xff\xd8\xff': '.jpg',      # JPEG
+    b'\x89PNG': '.png',            # PNG
+    b'GIF87a': '.gif',             # GIF87a
+    b'GIF89a': '.gif',             # GIF89a
+    b'RIFF': '.webp',              # WebP (RIFF container)
+}
+
 
 # ============================================================
 # 유틸리티 함수
@@ -247,6 +260,81 @@ def get_remote_files(remote_path, port):
     return files
 
 
+def get_cache_files(cache_path, port, limit=50, recent_minutes=5):
+    """카카오톡 캐시에서 최근 이미지 파일 찾기 (하위 폴더 포함)"""
+    # subprocess를 리스트 인자로 직접 호출 (경로 공백 문제 해결)
+    adb_exe = BLUESTACK_ADB if os.path.exists(BLUESTACK_ADB) else "adb"
+
+    try:
+        result = subprocess.run(
+            [adb_exe, '-s', f'127.0.0.1:{port}', 'shell',
+             'find', cache_path, '-type', 'f', '-size', '+1k', '-mmin', f'-{recent_minutes}'],
+            capture_output=True, text=True, timeout=60
+        )
+
+        if result.returncode != 0 or not result.stdout:
+            return []
+
+        files = []
+        for line in result.stdout.split('\n'):
+            filepath = line.strip()
+            if filepath and not filepath.startswith('find:'):
+                # 메타데이터 파일 제외
+                if not any(filepath.endswith(ext) for ext in ['.thumbnailHint', '.tmp', '.nomedia', '.thumb', '.bg']):
+                    files.append(filepath)
+        return files[:limit]
+
+    except Exception as e:
+        log(f"캐시 파일 검색 오류: {e}", "WARN")
+        return []
+
+
+def detect_image_type(filepath, port):
+    """파일의 이미지 타입 감지 (magic bytes 확인)"""
+    # 파일 헤더 읽기 (첫 8바이트)
+    cmd = f'shell head -c 8 "{filepath}" | od -A n -t x1'
+    output, code = adb_command(cmd, port)
+
+    if code != 0 or not output:
+        return None
+
+    # hex 문자열을 바이트로 변환
+    try:
+        hex_str = output.strip().replace(' ', '')
+        header = bytes.fromhex(hex_str)
+
+        # 시그니처 매칭
+        for sig, ext in IMAGE_SIGNATURES.items():
+            if header.startswith(sig):
+                return ext
+    except Exception:
+        pass
+
+    return None
+
+
+def pull_cache_file(remote_filepath, local_path, port):
+    """캐시 파일 다운로드 (확장자 자동 추가)"""
+    # 파일명 추출 (해시값)
+    filename = os.path.basename(remote_filepath)
+
+    # 이미지 타입 감지
+    ext = detect_image_type(remote_filepath, port)
+    if not ext:
+        return None  # 이미지가 아님
+
+    # 로컬 파일명 생성 (해시 + 확장자)
+    local_filename = f"{filename}{ext}"
+    local_filepath = os.path.join(local_path, local_filename)
+
+    # 다운로드
+    output, code = adb_command(f'pull "{remote_filepath}" "{local_filepath}"', port)
+
+    if code == 0 and os.path.exists(local_filepath):
+        return local_filepath, local_filename
+    return None
+
+
 def pull_file(remote_path, filename, local_path, port):
     """파일 다운로드"""
     remote = f"{remote_path}{filename}"
@@ -308,6 +396,8 @@ def main():
     parser.add_argument("--reset", "-r", action="store_true", help="처리된 파일 목록 초기화")
     parser.add_argument("--bridge-url", "-b", default=DEFAULT_BRIDGE_URL, help="브릿지 서버 URL")
     parser.add_argument("--local-path", "-l", default=DEFAULT_LOCAL_PATH, help="로컬 이미지 저장 경로")
+    parser.add_argument("--watch-cache", "-c", action="store_true", help="카카오톡 앱 캐시도 모니터링 (저장 버튼 없이 자동 감지)")
+    parser.add_argument("--cache-only", action="store_true", help="캐시만 모니터링 (공유 저장소 무시)")
     args = parser.parse_args()
 
     print()
@@ -355,27 +445,57 @@ def main():
     log("ADB 연결 성공!", "OK")
 
     # 카카오톡 이미지 경로 찾기
-    remote_path = find_kakao_image_path(port)
-    if not remote_path:
-        log("카카오톡 이미지 폴더를 찾을 수 없습니다.", "ERR")
+    remote_path = None
+    cache_available = False
+
+    if not args.cache_only:
+        remote_path = find_kakao_image_path(port)
+        if remote_path:
+            log(f"공유 저장소 경로: {remote_path}", "OK")
+
+    # 캐시 경로 확인 (--watch-cache 또는 --cache-only)
+    if args.watch_cache or args.cache_only:
+        output, code = adb_command(f"shell ls {KAKAO_CACHE_PATH}", port)
+        if code == 0 and "No such file" not in output:
+            cache_available = True
+            log(f"캐시 경로 접근 가능: {KAKAO_CACHE_PATH}", "OK")
+        else:
+            log("캐시 경로 접근 불가 (BlueStacks에서만 지원)", "WARN")
+
+    if not remote_path and not cache_available:
+        log("모니터링할 경로를 찾을 수 없습니다.", "ERR")
         print()
         print("확인 사항:")
         print("  1. 카카오톡에서 이미지를 한 번 이상 수신했는지 확인")
-        print("  2. 카카오톡 설정 > 채팅 > '사진 자동 저장' 활성화")
+        print("  2. --watch-cache 옵션으로 앱 캐시 모니터링 시도")
         print()
         sys.exit(1)
 
     # 시작 시 기존 파일 스킵
     if not _processed_files:
-        existing_files = get_remote_files(remote_path, port)
-        for f in existing_files:
-            _processed_files.add(f)
-        if existing_files:
-            log(f"기존 파일 {len(existing_files)}개 스킵")
+        if remote_path:
+            existing_files = get_remote_files(remote_path, port)
+            for f in existing_files:
+                _processed_files.add(f)
+            if existing_files:
+                log(f"기존 공유 저장소 파일 {len(existing_files)}개 스킵")
+
+        if cache_available:
+            # 초기화 시에는 모든 파일 스킵 (recent_minutes=9999로 설정)
+            existing_cache = get_cache_files(KAKAO_CACHE_PATH, port, limit=200, recent_minutes=9999)
+            for f in existing_cache:
+                _processed_files.add(f)
+            if existing_cache:
+                log(f"기존 캐시 파일 {len(existing_cache)}개 스킵")
+
         save_processed_data(local_path)
 
     print()
     log(f"모니터링 시작 (체크 간격: {args.interval}초)")
+    if remote_path:
+        log(f"공유 저장소: {remote_path}")
+    if cache_available:
+        log(f"앱 캐시: {KAKAO_CACHE_PATH} (저장 버튼 없이 자동 감지)")
     log(f"브릿지 URL: {args.bridge_url}")
     log("Ctrl+C로 종료")
     print("-" * 50)
@@ -383,30 +503,55 @@ def main():
     try:
         while True:
             try:
-                files = get_remote_files(remote_path, port)
+                # 1. 공유 저장소 모니터링 (기존 방식)
+                if remote_path:
+                    files = get_remote_files(remote_path, port)
+                    for filename in files:
+                        if filename not in _processed_files:
+                            log(f"[공유저장소] 새 이미지 감지: {filename}", "IMG")
 
-                for filename in files:
-                    if filename not in _processed_files:
-                        log(f"새 이미지 감지: {filename}", "IMG")
+                            local_file = pull_file(remote_path, filename, local_path, port)
+                            if local_file:
+                                log(f"다운로드 완료: {os.path.basename(local_file)}")
 
-                        # 다운로드
-                        local_file = pull_file(remote_path, filename, local_path, port)
-                        if local_file:
-                            log(f"다운로드 완료: {os.path.basename(local_file)}")
-
-                            # 해시 기반 중복 체크
-                            if is_duplicate_content(local_file):
-                                log(f"동일 내용 이미 처리됨, 스킵: {filename}")
+                                if is_duplicate_content(local_file):
+                                    log(f"동일 내용 이미 처리됨, 스킵: {filename}")
+                                else:
+                                    send_to_bridge(local_file, filename, args.bridge_url)
+                                    mark_content_processed(local_file)
                             else:
-                                # 브릿지로 전송
-                                send_to_bridge(local_file, filename, args.bridge_url)
-                                mark_content_processed(local_file)
-                        else:
-                            log(f"다운로드 실패: {filename}", "WARN")
+                                log(f"다운로드 실패: {filename}", "WARN")
 
-                        # 처리 완료 표시
-                        _processed_files.add(filename)
-                        save_processed_data(local_path)
+                            _processed_files.add(filename)
+                            save_processed_data(local_path)
+
+                # 2. 앱 캐시 모니터링 (저장 버튼 없이 자동 감지)
+                if cache_available:
+                    # 최근 5분 내 수정된 파일만 찾기 (성능 최적화)
+                    cache_files = get_cache_files(KAKAO_CACHE_PATH, port, limit=20, recent_minutes=5)
+                    for filepath in cache_files:
+                        if filepath not in _processed_files:
+                            # 이미지 타입 확인
+                            ext = detect_image_type(filepath, port)
+                            if ext:
+                                filename = os.path.basename(filepath)
+                                log(f"[캐시] 새 이미지 감지: {filename[:16]}...{ext}", "IMG")
+
+                                result = pull_cache_file(filepath, local_path, port)
+                                if result:
+                                    local_file, local_filename = result
+                                    log(f"다운로드 완료: {local_filename}")
+
+                                    if is_duplicate_content(local_file):
+                                        log(f"동일 내용 이미 처리됨, 스킵")
+                                    else:
+                                        send_to_bridge(local_file, local_filename, args.bridge_url)
+                                        mark_content_processed(local_file)
+                                else:
+                                    log(f"다운로드 실패: {filename[:16]}...", "WARN")
+
+                            _processed_files.add(filepath)
+                            save_processed_data(local_path)
 
                 time.sleep(args.interval)
 

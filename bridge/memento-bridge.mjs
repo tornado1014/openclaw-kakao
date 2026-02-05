@@ -16,6 +16,29 @@ import http from "http";
 import fs from "fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { execSync } from "node:child_process";
+
+// .env 파일 로드 (dotenv 없이 직접 로드)
+const __dirname_early = path.dirname(fileURLToPath(import.meta.url));
+try {
+  const envPath = path.join(__dirname_early, ".env");
+  if (fs.existsSync(envPath)) {
+    const envContent = fs.readFileSync(envPath, "utf8");
+    for (const line of envContent.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const eqIdx = trimmed.indexOf("=");
+      if (eqIdx > 0) {
+        const key = trimmed.substring(0, eqIdx).trim();
+        const val = trimmed.substring(eqIdx + 1).trim();
+        if (!process.env[key]) process.env[key] = val;
+      }
+    }
+    console.log("Loaded .env file");
+  }
+} catch (e) {
+  // ignore
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -46,6 +69,19 @@ const GEMINI_MODEL = "gemini-2.0-flash";
 
 // 이미지 저장 디렉토리
 const IMAGE_DIR = process.env.IMAGE_WATCH_DIR || path.join(__dirname, "..", "kakao-images");
+
+// ADB 설정 (이벤트 드리븐 이미지 감지용)
+const ADB_PATH = process.env.BLUESTACK_ADB_PATH || "C:/Program Files/BlueStacks_nxt/HD-Adb.exe";
+const ADB_PORT = process.env.ADB_PORT || "5555";
+const KAKAO_CACHE_PATH = "/sdcard/Android/data/com.kakao.talk/contents/";
+
+// 이미지 파일 시그니처
+const IMAGE_SIGNATURES = {
+  "ffd8ff": ".jpg",      // JPEG
+  "89504e47": ".png",    // PNG
+  "47494638": ".gif",    // GIF
+  "52494646": ".webp",   // WebP (RIFF)
+};
 
 // ============================================================
 // 초기화
@@ -85,6 +121,79 @@ function bumpGen(key) {
   generations.set(key, next);
   return next;
 }
+
+// ============================================================
+// ADB 이미지 가져오기 (이벤트 드리븐)
+// ============================================================
+function adbExec(args) {
+  const adbPath = fs.existsSync(ADB_PATH) ? `"${ADB_PATH}"` : "adb";
+  const cmd = `${adbPath} -s 127.0.0.1:${ADB_PORT} ${args}`;
+  console.log(`[adb] Running: ${cmd}`);
+  try {
+    const result = execSync(cmd, { encoding: "utf8", timeout: 30000, stdio: ['pipe', 'pipe', 'pipe'] });
+    console.log(`[adb] Result length: ${result.length}, content: "${result.trim().substring(0, 300)}"`);
+    return result;
+  } catch (e) {
+    console.error(`[adb] Command failed: ${e.message}`);
+    if (e.stdout) console.error(`[adb] stdout: ${e.stdout}`);
+    if (e.stderr) console.error(`[adb] stderr: ${e.stderr}`);
+    return null;
+  }
+}
+
+function findRecentCacheImages(minutes = 2) {
+  // 최근 N분 내 수정된 이미지 파일 찾기
+  // Windows 호환성: stderr는 catch에서 처리하므로 리다이렉션 제거
+  const output = adbExec(`shell find ${KAKAO_CACHE_PATH} -type f -size +1k -mmin -${minutes}`);
+  if (!output) return [];
+
+  const files = [];
+  for (const line of output.split("\n")) {
+    const filepath = line.trim();
+    if (!filepath) continue;
+    // 메타데이터 파일 제외
+    if (filepath.endsWith(".thumbnailHint") || filepath.endsWith(".tmp") ||
+        filepath.endsWith(".nomedia") || filepath.endsWith(".thumb") || filepath.endsWith(".bg")) {
+      continue;
+    }
+    files.push(filepath);
+  }
+  return files;
+}
+
+function detectImageType(remotePath) {
+  // 파일 헤더로 이미지 타입 감지
+  // xxd 사용 (od보다 호환성 좋음)
+  const output = adbExec(`shell xxd -l 8 -p "${remotePath}"`);
+  if (!output) return null;
+
+  const hex = output.trim().replace(/\s+/g, "").toLowerCase();
+
+  for (const [sig, ext] of Object.entries(IMAGE_SIGNATURES)) {
+    if (hex.startsWith(sig)) return ext;
+  }
+  return null;
+}
+
+function pullCacheImage(remotePath) {
+  // 이미지 타입 감지
+  const ext = detectImageType(remotePath);
+  if (!ext) return null;
+
+  // 로컬 파일명 생성
+  const hash = path.basename(remotePath);
+  const localFilename = `${hash}${ext}`;
+  const localPath = path.join(IMAGE_DIR, localFilename);
+
+  // 다운로드
+  const result = adbExec(`pull "${remotePath}" "${localPath}"`);
+  if (!result || !fs.existsSync(localPath)) return null;
+
+  return { localPath, localFilename };
+}
+
+// 이미지 분석 트리거 시 이미 처리한 파일 추적
+const processedCacheFiles = new Set();
 
 // ============================================================
 // Gateway API 호출
@@ -223,25 +332,45 @@ async function callGatewayChat(prompt, userKey = "memento", imageBase64 = null, 
     messages: [{ role: "user", content: finalPrompt }],
   };
 
-  const r = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${GATEWAY_TOKEN}`,
-      "Content-Type": "application/json",
-      "x-openclaw-agent-id": "main",
-    },
-    body: JSON.stringify(payload),
-  });
+  console.log(`[bridge] Calling Gateway for ${sender}...`);
+  const startTime = Date.now();
 
-  const text = await r.text();
-  if (!r.ok) throw new Error(`Gateway ${r.status}: ${text}`);
+  // 5분 타임아웃 설정
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 300000);
 
-  const data = JSON.parse(text);
-  const out =
-    data?.choices?.[0]?.message?.content ||
-    data?.choices?.[0]?.delta?.content ||
-    "(no content)";
-  return out;
+  try {
+    const r = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${GATEWAY_TOKEN}`,
+        "Content-Type": "application/json",
+        "x-openclaw-agent-id": "main",
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeoutId);
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.log(`[bridge] Gateway responded in ${elapsed}s`);
+
+    const text = await r.text();
+    if (!r.ok) throw new Error(`Gateway ${r.status}: ${text}`);
+
+    const data = JSON.parse(text);
+    const out =
+      data?.choices?.[0]?.message?.content ||
+      data?.choices?.[0]?.delta?.content ||
+      "(no content)";
+    return out;
+  } catch (e) {
+    clearTimeout(timeoutId);
+    if (e.name === 'AbortError') {
+      throw new Error('Gateway 응답 시간 초과 (5분)');
+    }
+    throw e;
+  }
 }
 
 // ============================================================
@@ -430,6 +559,138 @@ const server = http.createServer(async (req, res) => {
 
     res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
     return res.end(JSON.stringify({ hasResult: false }));
+  }
+
+  // POST /trigger-image - 이벤트 드리븐 이미지 감지 (MessengerBotR에서 호출)
+  if (req.method === "POST" && req.url === "/trigger-image") {
+    const raw = await readBody(req);
+    let data = null;
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      res.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
+      return res.end(JSON.stringify({ ok: false, error: "Invalid JSON" }));
+    }
+
+    const room = data?.room ?? "unknown";
+    const sender = data?.author?.name ?? data?.sender ?? "unknown";
+
+    console.log(`[bridge] Image trigger from ${sender}@${room}`);
+
+    // 1. 최근 캐시 이미지 찾기 (2분 내)
+    const cacheFiles = findRecentCacheImages(5);
+    console.log(`[bridge] Found ${cacheFiles.length} recent cache files`);
+
+    // 2. 아직 처리하지 않은 새 이미지 찾기
+    let newImage = null;
+    for (const filepath of cacheFiles) {
+      if (!processedCacheFiles.has(filepath)) {
+        newImage = filepath;
+        processedCacheFiles.add(filepath);
+        break;
+      }
+    }
+
+    if (!newImage) {
+      // 새 이미지 없음 - 잠시 대기 후 재시도
+      console.log(`[bridge] No new image yet, waiting...`);
+      await new Promise(r => setTimeout(r, 3000));
+
+      const retryFiles = findRecentCacheImages(5);
+      for (const filepath of retryFiles) {
+        if (!processedCacheFiles.has(filepath)) {
+          newImage = filepath;
+          processedCacheFiles.add(filepath);
+          break;
+        }
+      }
+    }
+
+    if (!newImage) {
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      return res.end(JSON.stringify({
+        ok: false,
+        text: "이미지를 찾을 수 없습니다. 잠시 후 다시 시도해주세요."
+      }));
+    }
+
+    // 3. 이미지 다운로드
+    console.log(`[bridge] Pulling image: ${path.basename(newImage)}`);
+    const pulled = pullCacheImage(newImage);
+
+    if (!pulled) {
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      return res.end(JSON.stringify({
+        ok: false,
+        text: "이미지 다운로드 실패. 지원하지 않는 형식일 수 있습니다."
+      }));
+    }
+
+    console.log(`[bridge] Image saved: ${pulled.localFilename}`);
+
+    // 4. 이미지 분석
+    let analysisResult = null;
+    const localPath = pulled.localPath.replace(/\\/g, "/");
+
+    try {
+      console.log(`[bridge] Starting Claude vision analysis...`);
+
+      const prompt = `이 로컬 이미지 파일을 분석해서 한국어로 설명해줘: ${localPath}`;
+      const key = routeKey(sender, room);
+      const gen = getGen(key);
+      const userKey = `${key}#${gen}`;
+
+      const url = `${GATEWAY_URL}/v1/chat/completions`;
+      const payload = {
+        model: "openclaw",
+        user: userKey,
+        messages: [{ role: "user", content: prompt }],
+      };
+
+      const r = await fetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${GATEWAY_TOKEN}`,
+          "Content-Type": "application/json",
+          "x-openclaw-agent-id": "main",
+        },
+        body: JSON.stringify(payload),
+      });
+
+      const text = await r.text();
+      if (!r.ok) throw new Error(`Gateway ${r.status}: ${text}`);
+
+      const responseData = JSON.parse(text);
+      analysisResult = responseData?.choices?.[0]?.message?.content || "(no content)";
+      analysisResult = `📷 이미지 분석 결과:\n\n${analysisResult}`;
+
+      console.log(`[bridge] Analysis complete for ${sender}@${room}`);
+
+    } catch (e) {
+      console.error(`[bridge] Vision analysis failed: ${e.message}`);
+
+      // Gemini 폴백
+      if (GEMINI_API_KEY) {
+        try {
+          console.log(`[bridge] Falling back to Gemini...`);
+          const imageBase64 = fs.readFileSync(pulled.localPath, "base64");
+          analysisResult = await analyzeImageWithGemini(imageBase64, "이 이미지를 분석해서 한국어로 설명해줘.");
+          analysisResult = `📷 이미지 분석 결과 (Gemini):\n\n${analysisResult}`;
+        } catch (geminiErr) {
+          analysisResult = `이미지 분석 실패: ${e.message}`;
+        }
+      } else {
+        analysisResult = `이미지 분석 실패: ${e.message}`;
+      }
+    }
+
+    // 5. 결과 반환
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+    return res.end(JSON.stringify({
+      ok: true,
+      text: analysisResult,
+      filename: pulled.localFilename
+    }));
   }
 
   // POST /webhook/memento - 메신저봇R 웹훅

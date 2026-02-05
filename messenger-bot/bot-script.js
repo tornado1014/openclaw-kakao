@@ -45,7 +45,7 @@ function postToBridge(payload) {
     .ignoreContentType(true)
     .header("Content-Type", "application/json")
     .requestBody(JSON.stringify(payload))
-    .timeout(30000)
+    .timeout(300000)  // 2분 타임아웃
     .method(org.jsoup.Connection.Method.POST)
     .execute()
     .body();
@@ -61,11 +61,45 @@ function parseText(raw) {
 // ============================================================
 // AI 요청 함수
 // ============================================================
+var THINKING_THRESHOLD = 50;  // 이 글자수 이상이면 "생각 중" 표시
+
+var SPINNER_VERBS = [
+  "묻고 더블로 가!",
+  "동작 그만, 밑장 빼기냐?",
+  "마포대교는 무너졌냐?",
+  "아수라발발타!",
+  "밥은 먹고 다니냐?",
+  "누구냐 넌?",
+  "호의가 계속되면, 그게 권리인 줄 알아요",
+  "너 지금부터 범인 해라",
+  "모히또 가서 몰디브나 한잔 할까..?",
+  "아들아, 너는 계획이 다 있구나",
+  "참으로 시의적절하다..",
+  "살아있네",
+  "명분이 없다 아입니꺼, 명분이..",
+  "니 내 누군지 아니?",
+  "혼자야? 어, 아직 싱글이야",
+  "진실의 방으로~",
+  "느그 아부지 뭐하시노?",
+  "고마해라, 마이 묵었다 아이가",
+  "니가 가라, 하와이",
+  "너나 잘하세요"
+];
+
+function getRandomSpinnerVerb() {
+  var idx = Math.floor(Math.random() * SPINNER_VERBS.length);
+  return SPINNER_VERBS[idx];
+}
+
 function askAI(msg, question) {
   if (!question) return;
   if (question.length > MAX_LEN) {
     question = question.substring(0, MAX_LEN) + "...";
   }
+
+  // 항상 "생각 중" 메시지 먼저 전송
+  msg.reply("🤔 (생각 중...) " + getRandomSpinnerVerb());
+
   var payload = {
     content: question,
     room: msg.room,
@@ -153,8 +187,39 @@ function handleSlash(msg) {
 }
 
 // ============================================================
-// 이미지 분석 (폴링 방식)
+// 이미지 분석 (이벤트 드리븐 방식)
 // ============================================================
+function triggerImageAnalysis(msg) {
+  // 브릿지에 이미지 트리거 요청 (ADB로 직접 가져옴)
+  var payload = {
+    room: msg.room,
+    author: { name: msg.author.name },
+    isGroupChat: msg.isGroupChat
+  };
+
+  try {
+    var Jsoup = org.jsoup.Jsoup;
+    var resp = Jsoup.connect(BRIDGE_BASE + "/trigger-image")
+      .ignoreContentType(true)
+      .header("Content-Type", "application/json")
+      .requestBody(JSON.stringify(payload))
+      .timeout(300000)  // 2분 타임아웃 (분석 시간 포함)
+      .method(org.jsoup.Connection.Method.POST)
+      .execute()
+      .body();
+
+    var data = JSON.parse(resp);
+    if (data.ok && data.text) {
+      msg.reply(data.text);
+    } else {
+      msg.reply(data.text || "이미지 분석에 실패했습니다.");
+    }
+  } catch (e) {
+    msg.reply("이미지 분석 오류: " + e);
+  }
+}
+
+// 폴링 방식 (폴백용)
 function checkImageResult(msg, retryCount) {
   if (retryCount > 30) {
     msg.reply("이미지 분석 시간 초과 (90초). 이미지를 저장했는지 확인해주세요.");
@@ -191,11 +256,11 @@ function isImageNotification(text) {
 function onMessage(msg) {
   var text = String(msg.content || "").trim();
 
-  // 이미지 알림 감지 (ADB Watcher와 연동)
+  // 이미지 알림 감지 (이벤트 드리븐 방식 - ADB Watcher 불필요)
   if (isImageNotification(text)) {
     msg.reply("이미지를 분석하고 있어요... 잠시만 기다려 주세요.");
-    java.lang.Thread.sleep(15000);  // 이미지 저장 대기
-    checkImageResult(msg, 0);
+    java.lang.Thread.sleep(2000);  // 이미지 캐시 저장 대기 (짧게)
+    triggerImageAnalysis(msg);     // 브릿지가 직접 ADB로 이미지 가져옴
     return;
   }
 
