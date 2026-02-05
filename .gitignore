@@ -1,0 +1,51 @@
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Runtime data
+kakao-images/
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.webp
+processed_files.json
+processed_hashes.json
+
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Build
+dist/
+build/
+*.js.map
+
+# Test
+coverage/
+.nyc_output/
+
+# Misc
+*.tmp
+*.temp
+*.bak

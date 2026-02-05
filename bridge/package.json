@@ -1,0 +1,22 @@
+{
+  "name": "openclaw-kakao-bridge",
+  "version": "1.0.0",
+  "description": "Bridge server for KakaoTalk and OpenClaw Gateway integration",
+  "type": "module",
+  "main": "memento-bridge.mjs",
+  "scripts": {
+    "start": "node memento-bridge.mjs",
+    "dev": "node --watch memento-bridge.mjs"
+  },
+  "keywords": [
+    "kakaotalk",
+    "chatbot",
+    "openclaw",
+    "claude",
+    "ai"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
