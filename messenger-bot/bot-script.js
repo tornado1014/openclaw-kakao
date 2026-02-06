@@ -129,14 +129,59 @@ function bridgeCommand(msg, command) {
 }
 
 // ============================================================
-// 슬래시 명령어 처리
+// URL 감지 및 요약
 // ============================================================
-function handleSlash(msg) {
-  var text = String(msg.content || "").trim();
-  if (text.indexOf("/") !== 0) return false;
+var URL_PATTERN = /https?:\/\/[^\s<>\[\]()]+/gi;
 
-  // /bridgeping - 브릿지 연결 확인
-  if (text === "/bridgeping") {
+function extractUrls(text) {
+  var matches = text.match(URL_PATTERN);
+  return matches || [];
+}
+
+function summarizeUrl(msg, url) {
+  var payload = {
+    url: url,
+    room: msg.room,
+    author: { name: msg.author.name },
+    isGroupChat: msg.isGroupChat
+  };
+  
+  try {
+    var Jsoup = org.jsoup.Jsoup;
+    var resp = Jsoup.connect(BRIDGE_BASE + "/webhook/url-summary")
+      .ignoreContentType(true)
+      .header("Content-Type", "application/json")
+      .requestBody(JSON.stringify(payload))
+      .timeout(120000)  // 2분 타임아웃
+      .method(org.jsoup.Connection.Method.POST)
+      .execute()
+      .body();
+    
+    var data = JSON.parse(resp);
+    if (data.ok && data.text) {
+      msg.reply(data.text);
+    } else {
+      msg.reply(data.text || "링크 요약에 실패했습니다.");
+    }
+  } catch (e) {
+    msg.reply("링크 요약 오류: " + e);
+  }
+}
+
+// ============================================================
+// 명령어 처리 (슬래시 + 점)
+// ============================================================
+function handleCommand(msg) {
+  var text = String(msg.content || "").trim();
+  
+  // 슬래시(/) 또는 점(.) 명령어 처리
+  var isSlash = text.indexOf("/") === 0;
+  var isDot = text.indexOf(".") === 0;
+  
+  if (!isSlash && !isDot) return false;
+
+  // /bridgeping 또는 .bridgeping - 브릿지 연결 확인
+  if (text === "/bridgeping" || text === ".bridgeping") {
     try {
       var resp = httpGet(BRIDGE_BASE + "/ping");
       msg.reply("BRIDGE: " + resp);
@@ -146,43 +191,41 @@ function handleSlash(msg) {
     return true;
   }
 
-  // /질문 <내용> - 그룹 채팅에서 AI 질문
-  if (text.indexOf("/질문") === 0) {
+  // .질문 <내용> 또는 /질문 <내용> - 그룹 채팅에서 AI 질문
+  if (text.indexOf(".질문") === 0 || text.indexOf("/질문") === 0) {
     var q = text.substring(3);
     q = q.replace(/^\s+/, "");
     if (!q) {
-      msg.reply("사용: /질문 <내용>");
+      msg.reply("사용: .질문 <내용>");
       return true;
     }
     askAI(msg, q);
     return true;
   }
 
-  // /help - 도움말
-  if (text === "/help") {
-    msg.reply("개인톡: 그냥 말하면 AI 답변\n그룹톡: /질문 <내용>\n/bridgeping /clear /whoami /on /off");
+  // /help 또는 .help - 도움말
+  if (text === "/help" || text === ".help") {
+    msg.reply("🧠 모멘토봇 도움말\n\n" +
+      "개인톡: 그냥 말하면 AI 답변\n" +
+      "그룹톡: .질문 <내용>\n" +
+      "URL 공유 시 자동 요약\n\n" +
+      "명령어: .ping .status .whoami");
     return true;
   }
 
-  // /ping - 봇 상태 확인
-  if (text === "/ping") { msg.reply("pong"); return true; }
+  // /ping 또는 .ping - 봇 상태 확인
+  if (text === "/ping" || text === ".ping") { msg.reply("pong 🧠"); return true; }
 
-  // /off - 봇 비활성화
-  if (text === "/off") { ENABLED = false; msg.reply("OK. 비활성화"); return true; }
+  // /status 또는 .status - 시스템 상태
+  if (text === "/status" || text === ".status") { bridgeCommand(msg, "status"); return true; }
 
-  // /on - 봇 활성화
-  if (text === "/on") { ENABLED = true; msg.reply("OK. 활성화"); return true; }
+  // /whoami 또는 .whoami - 세션 키 확인
+  if (text === "/whoami" || text === ".whoami") { bridgeCommand(msg, "whoami"); return true; }
 
-  // /status - 시스템 상태
-  if (text === "/status") { bridgeCommand(msg, "status"); return true; }
-
-  // /whoami - 세션 키 확인
-  if (text === "/whoami") { bridgeCommand(msg, "whoami"); return true; }
-
-  // /clear - 세션 초기화
-  if (text === "/clear") { bridgeCommand(msg, "clear"); return true; }
-
-  msg.reply("알 수 없는 명령어. /help");
+  // 알 수 없는 명령어는 무시 (그룹톡에서 다른 봇 명령어일 수 있음)
+  if (isDot) return false;  // 점 명령어는 모르면 무시
+  
+  msg.reply("알 수 없는 명령어. /help 또는 .help");
   return true;
 }
 
@@ -258,20 +301,28 @@ function onMessage(msg) {
 
   // 이미지 알림 감지 (이벤트 드리븐 방식 - ADB Watcher 불필요)
   if (isImageNotification(text)) {
-    msg.reply("이미지를 분석하고 있어요... 잠시만 기다려 주세요.");
+    msg.reply("🖼️ 이미지를 분석하고 있어요...");
     java.lang.Thread.sleep(2000);  // 이미지 캐시 저장 대기 (짧게)
     triggerImageAnalysis(msg);     // 브릿지가 직접 ADB로 이미지 가져옴
     return;
   }
 
-  // 슬래시 명령어 처리
-  if (handleSlash(msg)) return;
+  // 명령어 처리 (슬래시 + 점)
+  if (handleCommand(msg)) return;
 
   // 비활성화 상태면 무시
   if (!ENABLED) return;
 
   // 허용된 방이 아니면 무시
   if (!isRoomAllowed(msg.room)) return;
+
+  // URL 자동 감지 및 요약 (그룹/개인 모두)
+  var urls = extractUrls(text);
+  if (urls.length > 0) {
+    // 첫 번째 URL만 요약 (스팸 방지)
+    summarizeUrl(msg, urls[0]);
+    return;
+  }
 
   // 개인 채팅에서만 자동 응답
   if (!msg.isGroupChat) {
