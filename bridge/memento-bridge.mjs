@@ -1501,6 +1501,32 @@ ${pageContent.substring(0, 6000)}`;
 // ============================================================
 // 서버 시작
 // ============================================================
+server.on("error", (err) => {
+  if (err.code === "EADDRINUSE") {
+    console.error(`Port ${PORT} already in use. Killing zombie process...`);
+    try {
+      const netstat = execSync(
+        `netstat -ano | findstr ":${PORT}.*LISTENING"`,
+        { windowsHide: true, timeout: 5000 }
+      ).toString();
+      const match = netstat.match(/LISTENING\s+(\d+)/);
+      if (match && match[1] !== "0") {
+        const pid = match[1];
+        console.error(`Killing zombie PID ${pid} on port ${PORT}`);
+        execSync(`taskkill /PID ${pid} /F`, { windowsHide: true, timeout: 5000 });
+        setTimeout(() => {
+          server.listen(PORT, "0.0.0.0");
+        }, 2000);
+        return;
+      }
+    } catch (e) {
+      console.error(`Failed to kill zombie: ${e.message}`);
+    }
+    process.exit(1);
+  }
+  throw err;
+});
+
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`memento-bridge listening on port ${PORT}`);
   console.log(`gateway: ${GATEWAY_URL}`);
@@ -1512,3 +1538,18 @@ server.listen(PORT, "0.0.0.0", () => {
     console.log("Gemini fallback: enabled");
   }
 });
+
+// Graceful shutdown
+function shutdown(signal) {
+  console.log(`${signal} received. Shutting down gracefully...`);
+  server.close(() => {
+    console.log("Server closed.");
+    process.exit(0);
+  });
+  setTimeout(() => {
+    console.error("Forced exit after 10s timeout.");
+    process.exit(1);
+  }, 10000);
+}
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));

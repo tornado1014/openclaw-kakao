@@ -12,11 +12,17 @@ const __dirname = dirname(__filename);
 
 // === Config ===
 function loadConfig() {
-  const configPath = join(__dirname, 'config.json');
+  const localPath = join(__dirname, 'config.local.json');
+  const defaultPath = join(__dirname, 'config.json');
+  const examplePath = join(__dirname, 'config.example.json');
+  const configPath = existsSync(localPath) ? localPath
+    : existsSync(defaultPath) ? defaultPath
+    : examplePath;
   if (!existsSync(configPath)) {
-    console.error('[ERROR] config.json not found');
+    console.error('[ERROR] No config file found (config.local.json, config.json, or config.example.json)');
     process.exit(1);
   }
+  console.log(`[CONFIG] Loading: ${configPath}`);
   return JSON.parse(readFileSync(configPath, 'utf-8'));
 }
 

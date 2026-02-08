@@ -53,7 +53,8 @@ agents/*/HEARTBEAT.md
 agents/*/memory/
 agents/*/skills/
 
-# Monitor logs
+# Monitor config & logs
+monitor/config.local.json
 monitor/logs/
 
 # Misc
