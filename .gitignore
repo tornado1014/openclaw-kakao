@@ -45,6 +45,17 @@ build/
 coverage/
 .nyc_output/
 
+# Agent private files
+agents/*/USER-PRIVATE.md
+agents/*/USER.md
+agents/*/MEMORY.md
+agents/*/HEARTBEAT.md
+agents/*/memory/
+agents/*/skills/
+
+# Monitor logs
+monitor/logs/
+
 # Misc
 *.tmp
 *.temp

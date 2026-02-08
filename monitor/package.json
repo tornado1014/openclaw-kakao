@@ -1,0 +1,13 @@
+{
+  "name": "openclaw-monitor",
+  "version": "1.0.0",
+  "description": "OpenClaw service real-time monitor with toast + ntfy notifications",
+  "type": "module",
+  "main": "openclaw-monitor.mjs",
+  "scripts": {
+    "check": "node openclaw-monitor.mjs check",
+    "start": "node openclaw-monitor.mjs start",
+    "stop": "node openclaw-monitor.mjs stop",
+    "status": "node openclaw-monitor.mjs status"
+  }
+}

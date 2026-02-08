@@ -1,0 +1,28 @@
+{
+  "interval": 60,
+  "notification": {
+    "toast": { "enabled": true, "silent": false },
+    "ntfy": {
+      "enabled": true,
+      "server": "https://ntfy.sh",
+      "topic": "",
+      "priority": "high",
+      "tags": ["warning", "server"]
+    },
+    "cooldown": 300,
+    "onRecover": true
+  },
+  "autoRepair": true,
+  "escalation": {
+    "enabled": true,
+    "scriptPath": "",
+    "cooldown": 300,
+    "maxRetries": 2
+  },
+  "services": {
+    "gateway": { "enabled": true, "port": 25382 },
+    "kakaotalk": { "enabled": true, "port": 3000, "pm2Name": "clawdbot-kakaotalk" },
+    "bridge": { "enabled": true, "port": 8787, "pm2Name": "memento-bridge", "pingUrl": "http://localhost:8787/ping" },
+    "cloudflared": { "enabled": true, "tunnelId": "" }
+  }
+}

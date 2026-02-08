@@ -18,6 +18,7 @@ import fs from "fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { execSync } from "node:child_process";
+import { stripMarkdown } from "./markdown-remover.mjs";
 
 // .env 파일 로드 (dotenv 없이 직접 로드)
 const __dirname_early = path.dirname(fileURLToPath(import.meta.url));
@@ -48,7 +49,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // ============================================================
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8787;
 
-const GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || "http://localhost:25382";
+const GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || "http://100.79.99.33:25382";
 const GATEWAY_TOKEN =
   process.env.OPENCLAW_GATEWAY_TOKEN ||
   (() => {
@@ -98,6 +99,143 @@ const pendingImageResults = new Map(); // room -> { result, timestamp }
 const generations = new Map(); // key -> int
 
 // ============================================================
+// 보안: 개인정보 보호 (출력 필터 + 인젝션 탐지)
+// ============================================================
+
+const SECURITY_LOG_PATH = path.join(__dirname, "..", "..", "clawd", "logs", "security.log")
+  .replace(/\\/g, "/")
+  // fallback: 로그 디렉토리가 없으면 bridge 옆에 저장
+  || path.join(__dirname, "security.log");
+
+function logSecurityEvent(event) {
+  const entry = {
+    timestamp: new Date().toISOString(),
+    type: event.type,
+    room: event.room || "unknown",
+    sender: event.sender || "unknown",
+    message: (event.message || "").substring(0, 200),
+    action: event.action,
+    severity: event.severity || "medium",
+  };
+  try {
+    const logDir = path.dirname(SECURITY_LOG_PATH);
+    if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
+    fs.appendFileSync(SECURITY_LOG_PATH, JSON.stringify(entry) + "\n");
+  } catch (e) {
+    console.error(`[SECURITY] Failed to write log: ${e.message}`);
+  }
+  console.error(`[SECURITY:${event.severity}] ${event.type}: ${event.action}`);
+}
+
+// 개인정보 패턴 (그룹채팅 응답에서 차단)
+const PRIVATE_PATTERNS = [
+  /이현찬/g,
+  /남연/g,
+  /소윤/g,
+  /해든/g,
+  /2019년생/g,
+  /2023년생/g,
+  /성인\s*ADHD/gi,
+  /어린이집\s*교사/g,
+  /USER-PRIVATE\.md/gi,
+];
+
+function sanitizeOutput(text, isGroupChat, room, sender) {
+  if (!isGroupChat || !text) return text;
+
+  for (const pattern of PRIVATE_PATTERNS) {
+    // reset lastIndex for global regex
+    pattern.lastIndex = 0;
+    if (pattern.test(text)) {
+      logSecurityEvent({
+        type: "private_data_leak_blocked",
+        room,
+        sender,
+        message: `Pattern matched: ${pattern.source}`,
+        action: "blocked_entire_response",
+        severity: "critical",
+      });
+      return "죄송합니다, 해당 질문에는 답변할 수 없습니다.";
+    }
+  }
+
+  return text;
+}
+
+// 프롬프트 인젝션 탐지 패턴
+const INJECTION_PATTERNS = [
+  /시스템\s*프롬프트.*무시/i,
+  /system\s*prompt.*ignore/i,
+  /USER\.md/i,
+  /USER-PRIVATE/i,
+  /SOUL\.md/i,
+  /MEMORY\.md/i,
+  /AGENTS\.md/i,
+  /HEARTBEAT\.md/i,
+  /설정\s*파일.*보여/i,
+  /config.*file.*show/i,
+  /이전.*지시.*무시/i,
+  /ignore.*previous.*instruction/i,
+  /새로운\s*역할/i,
+  /관리자.*긴급.*지시/i,
+  /admin.*instruction/i,
+  /너의?\s*주인.*(?:이름|누구|정보|실명)/i,
+  /개인\s*정보.*(?:알려|보여|출력)/i,
+];
+
+function detectInjection(message, isGroupChat, room, sender) {
+  if (!isGroupChat || !message) return false;
+
+  for (const pattern of INJECTION_PATTERNS) {
+    if (pattern.test(message)) {
+      logSecurityEvent({
+        type: "injection_attempt",
+        room,
+        sender,
+        message: message.substring(0, 200),
+        action: "blocked",
+        severity: "high",
+      });
+      return true;
+    }
+  }
+  return false;
+}
+
+// ============================================================
+// 에이전트 라우팅: 개인별 에이전트 매핑
+// ============================================================
+
+// 개인 DM 사용자 → 에이전트 매핑
+// 새 사용자 추가 시: { sender: "카톡이름", agentId: "momento-xxx" }
+const PERSONAL_AGENT_MAP = [
+  { sender: "이현찬", agentId: "momento" },
+  { sender: "에렌델", agentId: "momento" },
+  { sender: "Myun", agentId: "momento-myun" },
+  // === 새 사용자 추가는 여기에 ===
+  // { sender: "홍길동", agentId: "momento-gildong" },
+];
+
+// 그룹채팅(단체대화방 + 오픈채팅방) 기본 에이전트
+const GROUP_AGENT_ID = "momento-public";
+
+function resolveIsGroupChat(room, sender, flagFromClient) {
+  if (flagFromClient === false) return false;
+  return true;
+}
+
+// sender + isGroupChat 기반으로 에이전트 ID 결정
+function resolveAgentId(sender, isGroupChat) {
+  // 그룹채팅 → 항상 공개 에이전트
+  if (isGroupChat) return GROUP_AGENT_ID;
+  // 개인 DM → 매핑 테이블에서 에이전트 찾기
+  const entry = PERSONAL_AGENT_MAP.find(e => e.sender === sender);
+  if (entry) return entry.agentId;
+  // 미등록 사용자의 DM → 공개 에이전트 (fail-safe)
+  return GROUP_AGENT_ID;
+}
+
+// ============================================================
 // 유틸리티 함수
 // ============================================================
 function readBody(req) {
@@ -121,6 +259,135 @@ function bumpGen(key) {
   const next = getGen(key) + 1;
   generations.set(key, next);
   return next;
+}
+
+// ============================================================
+// HTML → 텍스트 변환 (npm 의존성 없이)
+// ============================================================
+function stripHtmlToText(html) {
+  if (!html || typeof html !== "string") return "";
+
+  let text = html;
+
+  // 1. script, style, noscript, svg, head 블록 제거
+  text = text.replace(/<script[\s\S]*?<\/script>/gi, "");
+  text = text.replace(/<style[\s\S]*?<\/style>/gi, "");
+  text = text.replace(/<noscript[\s\S]*?<\/noscript>/gi, "");
+  text = text.replace(/<svg[\s\S]*?<\/svg>/gi, "");
+  text = text.replace(/<head[\s\S]*?<\/head>/gi, "");
+
+  // 2. 블록 요소를 줄바꿈으로 변환
+  text = text.replace(/<br\s*\/?>/gi, "\n");
+  text = text.replace(/<\/?(p|div|section|article|aside|header|footer|main|nav|blockquote)[\s>][^>]*>/gi, "\n");
+  text = text.replace(/<\/?(p|div|section|article|aside|header|footer|main|nav|blockquote)>/gi, "\n");
+  text = text.replace(/<\/?h[1-6][^>]*>/gi, "\n");
+  text = text.replace(/<li[^>]*>/gi, "\n- ");
+  text = text.replace(/<\/li>/gi, "");
+  text = text.replace(/<tr[^>]*>/gi, "\n");
+  text = text.replace(/<td[^>]*>/gi, " | ");
+
+  // 3. 나머지 HTML 태그 제거
+  text = text.replace(/<[^>]+>/g, "");
+
+  // 4. HTML 엔티티 디코딩
+  const entities = {
+    "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"',
+    "&#39;": "'", "&apos;": "'", "&nbsp;": " ", "&ndash;": "-",
+    "&mdash;": "--", "&laquo;": "<<", "&raquo;": ">>",
+    "&bull;": "*", "&middot;": ".", "&copy;": "(c)",
+    "&reg;": "(R)", "&trade;": "(TM)", "&hellip;": "...",
+  };
+  for (const [entity, replacement] of Object.entries(entities)) {
+    text = text.replaceAll(entity, replacement);
+  }
+  text = text.replace(/&#(\d+);/g, (_, num) => {
+    const code = parseInt(num, 10);
+    return code > 31 && code < 65535 ? String.fromCharCode(code) : "";
+  });
+  text = text.replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => {
+    const code = parseInt(hex, 16);
+    return code > 31 && code < 65535 ? String.fromCharCode(code) : "";
+  });
+
+  // 5. 공백 정규화
+  text = text.replace(/[ \t]+/g, " ");
+  text = text.replace(/\n[ \t]+/g, "\n");
+  text = text.replace(/[ \t]+\n/g, "\n");
+  text = text.replace(/\n{3,}/g, "\n\n");
+  text = text.trim();
+
+  return text;
+}
+
+// ============================================================
+// URL 직접 가져오기 (Gateway 경유 없이)
+// ============================================================
+async function fetchUrlContent(targetUrl, maxChars = 8000) {
+  const result = { content: "", title: "", error: null };
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000);
+
+    const response = await fetch(targetUrl, {
+      method: "GET",
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "identity",
+      },
+      redirect: "follow",
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeoutId);
+
+    const contentType = response.headers.get("content-type") || "";
+    if (!contentType.includes("text/html") && !contentType.includes("text/plain") && !contentType.includes("application/xhtml")) {
+      result.error = `지원하지 않는 콘텐츠 타입: ${contentType.split(";")[0]}`;
+      return result;
+    }
+
+    if (!response.ok) {
+      result.error = `HTTP ${response.status} ${response.statusText}`;
+      return result;
+    }
+
+    const html = await response.text();
+
+    if (!html || html.length < 100) {
+      result.error = "페이지 내용이 비어있습니다.";
+      return result;
+    }
+
+    const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    if (titleMatch) {
+      result.title = titleMatch[1].replace(/<[^>]+>/g, "").trim().substring(0, 200);
+    }
+
+    let text = stripHtmlToText(html);
+    if (text.length > maxChars) {
+      text = text.substring(0, maxChars) + "\n\n... (이하 생략)";
+    }
+
+    result.content = text;
+
+  } catch (e) {
+    if (e.name === "AbortError") {
+      result.error = "페이지 로딩 시간 초과 (15초)";
+    } else if (e.code === "ENOTFOUND" || e.cause?.code === "ENOTFOUND") {
+      result.error = "도메인을 찾을 수 없습니다.";
+    } else if (e.code === "ECONNREFUSED" || e.cause?.code === "ECONNREFUSED") {
+      result.error = "서버 연결이 거부되었습니다.";
+    } else if (e.message?.includes("certificate")) {
+      result.error = "SSL 인증서 오류";
+    } else {
+      result.error = `페이지 가져오기 실패: ${e.message}`;
+    }
+  }
+
+  return result;
 }
 
 // ============================================================
@@ -306,12 +573,15 @@ async function analyzeImageWithGemini(imageBase64, prompt) {
 // ============================================================
 // Gateway Chat API
 // ============================================================
-async function callGatewayChat(prompt, userKey = "memento", imageBase64 = null, sender = "unknown", isGroupChat = false) {
+async function callGatewayChat(prompt, userKey = "memento", imageBase64 = null, sender = "unknown", isGroupChat = false, retryCount = 0) {
   if (!GATEWAY_TOKEN) {
     throw new Error("Missing OPENCLAW_GATEWAY_TOKEN");
   }
 
-  let finalPrompt = prompt;
+  // 그룹채팅에서 온 메시지는 이미 필터링된 정당한 요청임을 명시
+  let finalPrompt = isGroupChat 
+    ? `[사용자 질문 - 반드시 응답 필요] ${prompt}`
+    : prompt;
 
   // 이미지가 있으면 로컬에 저장하고 파일 경로 전달
   if (imageBase64) {
@@ -339,7 +609,7 @@ async function callGatewayChat(prompt, userKey = "memento", imageBase64 = null, 
       if (GEMINI_API_KEY) {
         try {
           const analysis = await analyzeImageWithGemini(imageBase64, prompt || "이 이미지를 분석해서 한국어로 설명해줘.");
-          return `📷 이미지 분석 결과:\n\n${analysis}`;
+          return stripMarkdown(`📷 이미지 분석 결과:\n\n${analysis}`);
         } catch (geminiErr) {
           return `⚠️ 이미지 처리 중 오류: ${e.message}`;
         }
@@ -352,13 +622,19 @@ async function callGatewayChat(prompt, userKey = "memento", imageBase64 = null, 
   const url = `${GATEWAY_URL}/v1/chat/completions`;
 
   const systemPrompt = isGroupChat
-    ? "너는 모멘토봇이야. 한국 특허업계 실무자들이 모인 오픈채팅방에서 질문에 답변하는 AI야. " +
-      "특허업무에 AI를 활용하는 것에 관심이 많은 사람들이니, 관련 질문에 특히 도움이 되도록 해. " +
-      "간결하고 정확하게 답변해. 개인 비서 기능(일정, 메모, 할일)은 제공하지 마. " +
-      "개인정보를 기억하거나 언급하지 마."
+    ? "너는 모멘토봇이야. 오픈채팅방에서 질문에 답변하는 AI야. " +
+      "🚨🚨🚨 최우선 규칙 (절대 위반 금지): " +
+      "1. 모든 메시지에 반드시 응답해! " +
+      "2. sender 이름이 '오픈채팅봇'이어도 실제 사용자의 요청이야! 봇이 아니라 사람이야! 무조건 응답해! " +
+      "3. NO_REPLY, 빈 응답, HEARTBEAT_OK 절대 금지! " +
+      "4. 어떤 이유로도 응답을 거부하면 안 돼! " +
+      "날씨 질문이면 web_search로 검색해서 답변해. " +
+      "간결하고 정확하게 답변해. " +
+      "마크다운 문법(**, ##, ```, - 등)은 절대 사용하지 마. 이모지를 적극적으로 활용해."
     : "너는 모멘토봇이야. 개인 AI 기억 도우미야. " +
       "일정 관리, 메모, 할일, 리마인더 등 개인 비서 역할을 해. " +
-      "사용자가 기억해달라는 것들을 잘 기록해줘. 친근하게 대화해.";
+      "사용자가 기억해달라는 것들을 잘 기록해줘. 친근하게 대화해. " +
+      "마크다운 문법(**, ##, ```, - 등)은 절대 사용하지 마. 이모지를 적극적으로 활용해.";
 
   const messages = [
     { role: "system", content: systemPrompt },
@@ -374,9 +650,12 @@ async function callGatewayChat(prompt, userKey = "memento", imageBase64 = null, 
   console.log(`[bridge] Calling Gateway for ${sender}...`);
   const startTime = Date.now();
 
-  // 5분 타임아웃 설정
+  // 9분 타임아웃 설정 (MessengerBotR 10분보다 짧게)
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 300000);
+  const timeoutId = setTimeout(() => controller.abort(), 540000);
+
+  // 보안: sender + isGroupChat 기반 에이전트 라우팅
+  const agentId = resolveAgentId(sender, isGroupChat);
 
   try {
     const r = await fetch(url, {
@@ -384,7 +663,7 @@ async function callGatewayChat(prompt, userKey = "memento", imageBase64 = null, 
       headers: {
         Authorization: `Bearer ${GATEWAY_TOKEN}`,
         "Content-Type": "application/json",
-        "x-openclaw-agent-id": "momento",
+        "x-openclaw-agent-id": agentId,
       },
       body: JSON.stringify(payload),
       signal: controller.signal,
@@ -402,7 +681,22 @@ async function callGatewayChat(prompt, userKey = "memento", imageBase64 = null, 
       data?.choices?.[0]?.message?.content ||
       data?.choices?.[0]?.delta?.content ||
       "(no content)";
-    return out;
+
+    // Gateway가 빈 응답을 반환한 경우 1회 자동 재시도
+    if (out === "No response from OpenClaw." && retryCount < 1) {
+      console.log(`[bridge] Empty response from Gateway, retrying in 2s... (attempt ${retryCount + 1})`);
+      await new Promise(r => setTimeout(r, 2000));
+      return callGatewayChat(prompt, userKey, imageBase64, sender, isGroupChat, retryCount + 1);
+    }
+
+    // 재시도 후에도 빈 응답이면 사용자 친화적 메시지로 변환
+    if (out === "No response from OpenClaw.") {
+      console.log(`[bridge] Empty response persisted after retry for ${sender}`);
+      return "AI가 일시적으로 응답하지 못했어요. 잠시 후 다시 시도해주세요.";
+    }
+
+    // 카카오톡용 마크다운 제거
+    return stripMarkdown(out);
   } catch (e) {
     clearTimeout(timeoutId);
     if (e.name === 'AbortError') {
@@ -679,12 +973,16 @@ const server = http.createServer(async (req, res) => {
       const gen = getGen(key);
       const userKey = `${key}#${gen}`;
 
-      const imgIsGroup = !!data?.isGroupChat;
+      // 보안: 이중 검증으로 그룹채팅 판별
+      const imgIsGroup = resolveIsGroupChat(room, sender, data?.isGroupChat);
+      const imgAgentId = resolveAgentId(sender, imgIsGroup);
       const imgSystemPrompt = imgIsGroup
         ? "너는 모멘토봇이야. 한국 특허업계 실무자들이 모인 오픈채팅방에서 질문에 답변하는 AI야. " +
           "특허업무에 AI를 활용하는 것에 관심이 많은 사람들이니, 관련 질문에 특히 도움이 되도록 해. " +
-          "간결하고 정확하게 답변해. 개인정보를 기억하거나 언급하지 마."
-        : "너는 모멘토봇이야. 개인 AI 기억 도우미야. 친근하게 대화해.";
+          "간결하고 정확하게 답변해. 개인정보를 기억하거나 언급하지 마. " +
+          "마크다운 문법(**, ##, ```, - 등)은 절대 사용하지 마. 이모지를 적극적으로 활용해."
+        : "너는 모멘토봇이야. 개인 AI 기억 도우미야. 친근하게 대화해. " +
+          "마크다운 문법(**, ##, ```, - 등)은 절대 사용하지 마. 이모지를 적극적으로 활용해.";
 
       const url = `${GATEWAY_URL}/v1/chat/completions`;
       const payload = {
@@ -701,7 +999,7 @@ const server = http.createServer(async (req, res) => {
         headers: {
           Authorization: `Bearer ${GATEWAY_TOKEN}`,
           "Content-Type": "application/json",
-          "x-openclaw-agent-id": "momento",
+          "x-openclaw-agent-id": imgAgentId,
         },
         body: JSON.stringify(payload),
       });
@@ -733,11 +1031,13 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    // 5. 결과 반환
+    // 5. 결과 반환 (보안: 출력 필터 적용 + 마크다운 제거)
+    const imgIsGroup = resolveIsGroupChat(room, sender, data?.isGroupChat);
+    const safeAnalysis = stripMarkdown(sanitizeOutput(analysisResult, imgIsGroup, room, sender));
     res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
     return res.end(JSON.stringify({
       ok: true,
-      text: analysisResult,
+      text: safeAnalysis,
       filename: pulled.localFilename
     }));
   }
@@ -764,60 +1064,336 @@ const server = http.createServer(async (req, res) => {
 
     console.log(`[bridge] URL summary request: ${url} from ${sender}@${room}`);
 
-    try {
-      // 1. Gateway의 web_fetch 도구로 페이지 내용 가져오기
-      const fetchResult = await gatewayInvoke("web_fetch", null, { 
-        url: url,
-        extractMode: "markdown",
-        maxChars: 8000
-      });
-
-      const pageContent = fetchResult?.content || fetchResult?.text || fetchResult || "";
+    // ============================================================
+    // Threads.com 특별 처리 (브라우저 스크래핑)
+    // Firecrawl이 Threads를 지원하지 않아서 브라우저로 직접 스크래핑
+    // ============================================================
+    if (url.includes("threads.com") || url.includes("threads.net")) {
+      console.log(`[bridge] Threads URL detected, using browser scraping...`);
       
-      if (!pageContent || pageContent.length < 50) {
+      try {
+        // 1. 브라우저로 페이지 열기
+        const openResult = await gatewayInvoke("browser", "open", {
+          targetUrl: url,
+          profile: "openclaw"
+        });
+        
+        // Gateway 응답 형식: { content: [...], details: { targetId, ... } }
+        const targetId = openResult?.details?.targetId || openResult?.targetId;
+        if (!targetId) {
+          console.error(`[bridge] Browser open result:`, JSON.stringify(openResult, null, 2));
+          throw new Error("Failed to open browser tab");
+        }
+        
+        console.log(`[bridge] Browser tab opened: ${targetId}`);
+        
+        // 2. 5초 대기 (JS 렌더링)
+        await new Promise(r => setTimeout(r, 5000));
+        
+        // 3. 스냅샷 가져오기
+        const snapshot = await gatewayInvoke("browser", "snapshot", {
+          targetId,
+          profile: "openclaw"
+        });
+        
+        // 4. 브라우저 탭 닫기
+        await gatewayInvoke("browser", "close", {
+          targetId,
+          profile: "openclaw"
+        }).catch(() => {}); // 닫기 실패는 무시
+        
+        console.log(`[bridge] Browser snapshot complete`);
+        
+        // 5. 스냅샷에서 콘텐츠 추출
+        const snapshotText = typeof snapshot === "string" ? snapshot : JSON.stringify(snapshot, null, 2);
+        
+        // 6. AI로 요약 요청
+        const key = routeKey(sender, room);
+        const gen = getGen(key);
+        const userKey = `${key}#${gen}`;
+        const threadsIsGroup = resolveIsGroupChat(room, sender, data?.isGroupChat);
+        
+        const summaryPrompt = `다음은 Threads 게시물의 브라우저 스냅샷이야. 핵심 내용을 한국어로 요약해줘.
+
+형식:
+👤 작성자: [이름]
+📝 내용: [핵심 내용 요약]
+💬 주요 포인트 (있으면)
+📊 반응: 좋아요/댓글/리포스트 수 (있으면)
+
+게시물 내용만 추출해서 깔끔하게 정리해. 네비게이션이나 UI 요소는 무시해.
+
+스냅샷:
+${snapshotText.substring(0, 15000)}`;
+
+        const summaryResult = await callGatewayChat(summaryPrompt, userKey, null, sender, threadsIsGroup);
+        
+        const finalText = stripMarkdown(sanitizeOutput(`🧵 ${url}\n\n${summaryResult}`, threadsIsGroup, room, sender));
+        
+        console.log(`[bridge] Threads summary complete`);
+        
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-        return res.end(JSON.stringify({ 
-          ok: false, 
-          text: "페이지 내용을 가져올 수 없습니다." 
+        return res.end(JSON.stringify({ ok: true, text: finalText }));
+        
+      } catch (e) {
+        console.error(`[bridge] Threads scraping error: ${e.message}`);
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        return res.end(JSON.stringify({
+          ok: false,
+          text: `Threads 스크래핑 실패: ${e.message}`
         }));
       }
+    }
+
+    try {
+      // 0. 단축 URL 해석 + 네이버 블로그 모바일 변환
+      let resolvedUrl = url;
+      try {
+        const shortDomains = /^https?:\/\/(?:naver\.me|me2\.do|han\.gl|bit\.ly|vo\.la)\//i;
+        if (shortDomains.test(url)) {
+          let cur = url;
+          for (let i = 0; i < 5; i++) {
+            const rr = await fetch(cur, { method: "HEAD", redirect: "manual", headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" } });
+            const loc = rr.headers.get("location");
+            if (!loc || ![301,302,303,307,308].includes(rr.status)) break;
+            cur = new URL(loc, cur).toString();
+          }
+          resolvedUrl = cur;
+          console.log(`[bridge] Short URL resolved: ${url} → ${resolvedUrl}`);
+        }
+        // 네이버 블로그 → 모바일 버전 (iframe 우회)
+        if (resolvedUrl.includes("blog.naver.com") && !resolvedUrl.includes("m.blog.naver.com")) {
+          resolvedUrl = resolvedUrl.replace("blog.naver.com", "m.blog.naver.com");
+          console.log(`[bridge] Blog converted to mobile: ${resolvedUrl}`);
+        }
+      } catch (resolveErr) {
+        console.log(`[bridge] URL resolve failed (using original): ${resolveErr.message}`);
+      }
+
+      // 0.5. 네이버 지도 URL → 모바일 페이지 Apollo State로 풍부한 장소 정보 가져오기
+      const naverPlaceMatch = resolvedUrl.match(/map\.naver\.com\/p\/entry\/place\/(\d+)/);
+      if (naverPlaceMatch) {
+        const placeId = naverPlaceMatch[1];
+        console.log(`[bridge] Naver Map detected, fetching rich place info: ${placeId}`);
+        try {
+          // m.place.naver.com/place/{id}/home → 자동 리다이렉트로 올바른 businessType으로 이동
+          const mobileRes = await fetch(`https://m.place.naver.com/place/${placeId}/home`, {
+            headers: {
+              "User-Agent": "Mozilla/5.0 (Linux; Android 10; SM-G981B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36",
+              "Accept-Language": "ko-KR,ko;q=0.9"
+            },
+            redirect: "follow"
+          });
+          const mobileHtml = await mobileRes.text();
+          const apolloMatch = mobileHtml.match(/window\.__APOLLO_STATE__\s*=\s*(\{.*?\});/s);
+
+          if (apolloMatch) {
+            const apollo = JSON.parse(apolloMatch[1]);
+            const detail = apollo[`PlaceDetailBase:${placeId}`];
+
+            if (detail && detail.name) {
+              // --- 기본 정보 ---
+              const lines = [];
+              lines.push(`📍 ${detail.name}`);
+              if (detail.category) lines.push(`📂 ${detail.category}`);
+              if (detail.roadAddress) lines.push(`📫 ${detail.roadAddress}`);
+              else if (detail.address) lines.push(`📫 ${detail.address}`);
+              if (detail.phone) lines.push(`📞 ${detail.phone}`);
+
+              // --- 영업 정보 ---
+              if (detail.businessHours?.description) {
+                lines.push(`🕐 ${detail.businessHours.description}`);
+              } else if (detail.hideBusinessHours === false && detail.missingInfo?.isBizHourMissing) {
+                // 영업시간 정보 없음
+              }
+
+              // --- 찾아오는 길 ---
+              const subway = apollo[`SubwayStationInfo:${Object.keys(apollo).find(k => k.startsWith("SubwayStationInfo:"))?.split(":")[1]}`];
+              if (subway) {
+                lines.push(`🚇 ${subway.displayName || subway.name} ${subway.nearestExit ? subway.nearestExit + "번 출구" : ""} 도보 ${subway.walkTime}분 (${subway.walkingDistance}m)`);
+              }
+              if (detail.road) lines.push(`🚶 ${detail.road}`);
+
+              // --- 별점 & 리뷰 요약 ---
+              if (detail.visitorReviewsScore) {
+                lines.push(`\n⭐ ${detail.visitorReviewsScore}/5.0 (방문자 리뷰 ${detail.visitorReviewsTotal || 0}건)`);
+              }
+
+              // --- 리뷰 키워드 (투표 기반, 상위 5개) ---
+              const reviewStats = apollo[`VisitorReviewStatsResult:${placeId}`];
+              const keywords = reviewStats?.analysis?.votedKeyword?.details;
+              if (keywords && keywords.length > 0) {
+                const topKw = keywords.slice(0, 5).map(k => `"${k.displayName}" ${k.count}`).join(", ");
+                lines.push(`💬 키워드: ${topKw}`);
+              }
+
+              // --- 한줄 리뷰 ---
+              if (detail.microReviews && detail.microReviews.length > 0) {
+                lines.push(`💭 "${detail.microReviews[0]}"`);
+              }
+
+              // --- 메뉴 (최대 5개) ---
+              const menuKeys = Object.keys(apollo).filter(k => k.startsWith(`Menu:${placeId}_`)).sort((a, b) => {
+                const ai = parseInt(a.split("_").pop());
+                const bi = parseInt(b.split("_").pop());
+                return ai - bi;
+              });
+              if (menuKeys.length > 0) {
+                lines.push(`\n🍽️ 메뉴`);
+                menuKeys.slice(0, 5).forEach(k => {
+                  const m = apollo[k];
+                  if (m && m.name) {
+                    const price = m.price ? ` - ${Number(m.price).toLocaleString()}원` : "";
+                    const rec = m.recommend ? " ⭐추천" : "";
+                    lines.push(`  • ${m.name}${price}${rec}`);
+                  }
+                });
+                if (menuKeys.length > 5) lines.push(`  ... 외 ${menuKeys.length - 5}개`);
+              }
+
+              // --- 편의시설 ---
+              if (detail.conveniences && detail.conveniences.length > 0) {
+                lines.push(`\n🏷️ ${detail.conveniences.join(" · ")}`);
+              }
+
+              // --- 결제 정보 ---
+              if (detail.paymentInfo && detail.paymentInfo.length > 0) {
+                lines.push(`💳 ${detail.paymentInfo.join(", ")}`);
+              }
+
+              // --- 블로그 리뷰 (최대 2개, 제목+발췌) ---
+              const blogKeys = Object.keys(apollo).filter(k => k.startsWith("FsasReview:blog_"));
+              if (blogKeys.length > 0) {
+                lines.push(`\n📝 블로그 리뷰`);
+                blogKeys.slice(0, 2).forEach(k => {
+                  const b = apollo[k];
+                  if (b && b.title) {
+                    const excerpt = b.contents ? b.contents.substring(0, 60) + "..." : "";
+                    lines.push(`  • ${b.title}`);
+                    if (excerpt) lines.push(`    ${excerpt}`);
+                  }
+                });
+              }
+
+              lines.push(`\n🔗 ${url}`);
+
+              console.log(`[bridge] Naver Place rich info fetched: ${detail.name} (${menuKeys.length} menus, ${blogKeys.length} blog reviews)`);
+              const placeIsGroup = resolveIsGroupChat(room, sender, data?.isGroupChat);
+              const placeText = sanitizeOutput(lines.join("\n"), placeIsGroup, room, sender);
+              res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+              return res.end(JSON.stringify({ ok: true, text: placeText }));
+            }
+          }
+
+          // Apollo state 파싱 실패 시 Summary API 폴백
+          console.log(`[bridge] Apollo state not found, falling back to summary API`);
+          const summaryRes = await fetch(`https://map.naver.com/p/api/place/summary/${placeId}`, {
+            headers: {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+              "Referer": "https://map.naver.com/"
+            }
+          });
+          const summaryData = await summaryRes.json();
+          const d = summaryData?.data?.placeDetail;
+          if (d) {
+            const info = [
+              `📍 ${d.name}`,
+              d.category?.category ? `📂 ${d.category.category}` : null,
+              d.address?.roadAddress ? `📫 ${d.address.roadAddress}` : (d.address?.address ? `📫 ${d.address.address}` : null),
+              d.businessHours?.description ? `🕐 ${d.businessHours.description}` : null,
+              d.visitorReviews ? `⭐ ${d.visitorReviews.score}/5.0 (${d.visitorReviews.displayText})` : null,
+              d.blogReviews?.total ? `📝 블로그 리뷰 ${d.blogReviews.total}건` : null,
+              `\n🔗 ${url}`
+            ].filter(Boolean).join("\n");
+
+            console.log(`[bridge] Naver Place summary fetched: ${d.name}`);
+            const placeIsGroup = resolveIsGroupChat(room, sender, data?.isGroupChat);
+            const placeText = sanitizeOutput(info, placeIsGroup, room, sender);
+            res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+            return res.end(JSON.stringify({ ok: true, text: placeText }));
+          }
+        } catch (placeErr) {
+          console.log(`[bridge] Naver Place fetch failed: ${placeErr.message}, falling through to normal fetch`);
+        }
+      }
+
+      // 1. 직접 페이지 내용 가져오기
+      console.log(`[bridge] Fetching URL directly: ${resolvedUrl}`);
+      const fetchResult = await fetchUrlContent(resolvedUrl, 8000);
+
+      let pageContent = fetchResult.content;
+      let pageTitle = fetchResult.title;
+
+      // 직접 fetch 실패 시 Gateway 폴백
+      if (!pageContent || pageContent.length < 50) {
+        if (fetchResult.error) {
+          console.log(`[bridge] Direct fetch failed: ${fetchResult.error}, trying gateway fallback...`);
+        }
+        try {
+          const gwResult = await gatewayInvoke("web_fetch", null, {
+            url: resolvedUrl,
+            extractMode: "markdown",
+            maxChars: 8000
+          });
+          const gwContent = gwResult?.content || gwResult?.text || (typeof gwResult === "string" ? gwResult : "");
+          if (gwContent && gwContent.length >= 50) {
+            pageContent = gwContent;
+            console.log(`[bridge] Gateway fallback succeeded (${gwContent.length} chars)`);
+          }
+        } catch (gwErr) {
+          console.log(`[bridge] Gateway fallback also failed: ${gwErr.message}`);
+        }
+      }
+
+      // 두 방법 모두 실패
+      if (!pageContent || pageContent.length < 50) {
+        const reason = fetchResult.error || "내용을 추출할 수 없습니다.";
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        return res.end(JSON.stringify({
+          ok: false,
+          text: `페이지 내용을 가져올 수 없습니다. (${reason})`
+        }));
+      }
+
+      console.log(`[bridge] Fetched ${pageContent.length} chars, title: "${pageTitle || "(no title)"}"`);
 
       // 2. AI로 요약 요청
       const key = routeKey(sender, room);
       const gen = getGen(key);
       const userKey = `${key}#${gen}`;
 
-      const summaryPrompt = `다음 웹페이지 내용을 한국어로 요약해줘. 
-      
+      const summaryPrompt = `다음 웹페이지 내용을 한국어로 요약해줘.
+
 형식:
 👉 [제목]
 📣 핵심 포인트 1
-💡 핵심 포인트 2  
+💡 핵심 포인트 2
 🎯 핵심 포인트 3
 
 간결하고 핵심만 담아서 3-5개 포인트로 요약해. 이모지를 활용해서 보기 좋게.
 
 URL: ${url}
-
+${pageTitle ? `페이지 제목: ${pageTitle}\n` : ""}
 페이지 내용:
 ${pageContent.substring(0, 6000)}`;
 
-      const summaryResult = await callGatewayChat(summaryPrompt, userKey, null, sender, !!data?.isGroupChat);
+      const urlIsGroup = resolveIsGroupChat(room, sender, data?.isGroupChat);
+      const summaryResult = await callGatewayChat(summaryPrompt, userKey, null, sender, urlIsGroup);
 
-      // 3. 결과 포맷팅
-      const finalText = `🔗 ${url}\n\n${summaryResult}`;
+      // 3. 결과 포맷팅 (보안: 출력 필터 적용 + 마크다운 제거)
+      const finalText = stripMarkdown(sanitizeOutput(`🔗 ${url}\n\n${summaryResult}`, urlIsGroup, room, sender));
 
       console.log(`[bridge] URL summary complete for ${url}`);
-      
+
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
       return res.end(JSON.stringify({ ok: true, text: finalText }));
 
     } catch (e) {
       console.error(`[bridge] URL summary error: ${e.message}`);
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-      return res.end(JSON.stringify({ 
-        ok: false, 
-        text: `URL 요약 실패: ${e.message}` 
+      return res.end(JSON.stringify({
+        ok: false,
+        text: `URL 요약 실패: ${e.message}`
       }));
     }
   }
@@ -834,8 +1410,23 @@ ${pageContent.substring(0, 6000)}`;
 
     const content = data?.content ?? "";
     const imageBase64 = data?.imageBase64 ?? null;
-    const sender = data?.author?.name ?? data?.sender ?? "unknown";
+    let sender = data?.author?.name ?? data?.sender ?? "unknown";
     const room = data?.room ?? "unknown";
+    
+    // "오픈채팅봇" sender를 "질문자"로 변환 (AI가 봇으로 오해하지 않도록)
+    if (sender === "오픈채팅봇") {
+      sender = "질문자";
+      console.log(`[bridge] Renamed sender: 오픈채팅봇 → 질문자`);
+    }
+
+    // 보안: isGroupChat 이중 검증
+    const isGroupChat = resolveIsGroupChat(room, sender, data?.isGroupChat);
+
+    // 보안: 프롬프트 인젝션 탐지 (그룹채팅만)
+    if (detectInjection(content, isGroupChat, room, sender)) {
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      return res.end(JSON.stringify({ text: "죄송합니다, 해당 요청은 처리할 수 없습니다." }));
+    }
 
     const key = routeKey(sender, room);
     const gen = getGen(key);
@@ -886,10 +1477,16 @@ ${pageContent.substring(0, 6000)}`;
 
     // Normal chat mode
     try {
-      console.log(`[bridge] Received - content.length=${content.length}, hasImage=${!!imageBase64}, sender=${sender}`);
-      const reply = await callGatewayChat(content, userKey, imageBase64, sender, !!data?.isGroupChat);
+      console.log(`[bridge] Received - content.length=${content.length}, hasImage=${!!imageBase64}, sender=${sender}, isGroupChat=${isGroupChat}`);
+      
+      // 참고: 그룹채팅 필터링은 MessengerBotR에서 처리 (.질문, .요약 명령어)
+      // Bridge는 전달받은 모든 메시지 처리
+      
+      const reply = await callGatewayChat(content, userKey, imageBase64, sender, isGroupChat);
+      // 보안: 출력 필터 (개인정보 최종 차단) + 마크다운 이중 제거
+      const safeReply = stripMarkdown(sanitizeOutput(reply, isGroupChat, room, sender));
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-      return res.end(JSON.stringify({ text: reply }));
+      return res.end(JSON.stringify({ text: safeReply }));
     } catch (e) {
       console.error(`[bridge] Error: ${e?.message || e}`);
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
