@@ -53,8 +53,9 @@ agents/*/HEARTBEAT.md
 agents/*/memory/
 agents/*/skills/
 
-# Monitor config & logs
+# Monitor config & runtime state
 monitor/config.local.json
+monitor/monitor-state.json
 monitor/logs/
 
 # Misc

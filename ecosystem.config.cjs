@@ -13,14 +13,6 @@ module.exports = {
       min_uptime: '30s',
       env: { NODE_ENV: 'production' }
     },
-    {
-      name: 'openclaw-monitor',
-      script: 'openclaw-monitor.mjs',
-      args: 'daemon',
-      cwd: path.join(__dirname, 'monitor'),
-      autorestart: true,
-      max_memory_restart: '200M',
-      env: { NODE_ENV: 'production' }
-    }
+    // openclaw-monitor는 schtasks로 독립 실행 (PM2 공동운명 방지)
   ]
 };

@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 // openclaw-monitor.mjs - OpenClaw 서비스 실시간 모니터링 데몬
-// Usage: node openclaw-monitor.mjs [check|start|stop|status|daemon]
+// Usage: node openclaw-monitor.mjs [check|watchdog|daemon|status]
+// watchdog: schtasks용 1회 실행 모드 (PM2 독립, 상태 파일 기반)
 
 import { exec, execSync } from 'child_process';
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 
@@ -28,8 +29,9 @@ function loadConfig() {
 
 const config = loadConfig();
 const PM2_CWD = join(__dirname, '..');
+const STATE_FILE = join(__dirname, 'monitor-state.json');
 
-// === State ===
+// === Persistent State (file-based for watchdog mode) ===
 const state = {
   gateway:     { status: 'unknown', lastFail: null, lastNotify: null },
   kakaotalk:   { status: 'unknown', lastFail: null, lastNotify: null },
@@ -37,9 +39,38 @@ const state = {
   cloudflared: { status: 'unknown', lastFail: null, lastNotify: null }
 };
 
-// Escalation tracking
 let lastEscalation = null;
 let escalationCount = 0;
+
+function loadState() {
+  if (!existsSync(STATE_FILE)) return;
+  try {
+    const saved = JSON.parse(readFileSync(STATE_FILE, 'utf-8'));
+    if (saved.services) {
+      for (const [name, s] of Object.entries(saved.services)) {
+        if (state[name]) Object.assign(state[name], s);
+      }
+    }
+    if (saved.lastEscalation) lastEscalation = saved.lastEscalation;
+    if (saved.escalationCount != null) escalationCount = saved.escalationCount;
+  } catch {
+    // corrupted state file, start fresh
+  }
+}
+
+function saveState() {
+  const data = {
+    services: state,
+    lastEscalation,
+    escalationCount,
+    updatedAt: Date.now()
+  };
+  try {
+    writeFileSync(STATE_FILE, JSON.stringify(data, null, 2));
+  } catch {
+    // state save failed silently
+  }
+}
 
 // === Utility: exec as promise ===
 function run(cmd, timeoutMs = 15000, cwd = undefined) {
@@ -52,6 +83,33 @@ function run(cmd, timeoutMs = 15000, cwd = undefined) {
 
 function pm2Run(cmd, timeoutMs = 20000) {
   return run(`npx pm2 ${cmd}`, timeoutMs, PM2_CWD);
+}
+
+// === PM2 Daemon Health ===
+
+async function checkPm2Daemon() {
+  const result = await pm2Run('ping', 10000);
+  return result.ok;
+}
+
+async function bootstrapPm2() {
+  log('RESCUE', 'PM2 daemon dead or empty - bootstrapping all ecosystems...');
+  const ecosystems = config.ecosystems || {};
+  for (const [label, ecoPath] of Object.entries(ecosystems)) {
+    if (!existsSync(ecoPath)) {
+      log('RESCUE', `Ecosystem not found: ${ecoPath} (${label})`);
+      continue;
+    }
+    const ecoCwd = dirname(ecoPath);
+    log('RESCUE', `Starting ecosystem: ${label} (${ecoPath})`);
+    const result = await run(`npx pm2 start "${ecoPath}"`, 30000, ecoCwd);
+    if (result.ok) {
+      log('RESCUE', `${label}: started successfully`);
+    } else {
+      log('RESCUE', `${label}: failed - ${result.stderr}`);
+    }
+  }
+  await sleep(3000);
 }
 
 // === Notifications ===
@@ -107,9 +165,14 @@ function shouldNotify(serviceName) {
 async function checkGateway() {
   const svc = config.services.gateway;
   if (!svc?.enabled) return 'disabled';
-  const result = await run('openclaw gateway status');
-  if (result.stdout.includes('RPC probe: ok')) return 'ok';
-  return 'fail';
+  const probeUrl = svc.probeUrl || `http://localhost:${svc.port}/`;
+  try {
+    const resp = await fetch(probeUrl, { signal: AbortSignal.timeout(5000) });
+    // Gateway responds with HTML dashboard or redirect - any HTTP response = alive
+    return resp.ok || resp.status < 500 ? 'ok' : 'fail';
+  } catch {
+    return 'fail';
+  }
 }
 
 async function checkPm2Process(name) {
@@ -136,10 +199,8 @@ async function checkKakaotalk() {
 async function checkBridge() {
   const svc = config.services.bridge;
   if (!svc?.enabled) return 'disabled';
-  // pm2 status check
   const pm2Status = await checkPm2Process(svc.pm2Name);
   if (pm2Status !== 'ok') return 'fail';
-  // ping check
   if (svc.pingUrl) {
     try {
       const resp = await fetch(svc.pingUrl, { signal: AbortSignal.timeout(5000) });
@@ -158,7 +219,6 @@ async function checkCloudflared() {
   if (!svc?.enabled) return 'disabled';
   const result = await run('powershell -NoProfile -Command "(Get-Service cloudflared).Status"', 10000);
   if (result.stdout.trim() !== 'Running') return 'fail';
-  // Check actual tunnel connections
   const tunnelResult = await run(`cloudflared tunnel info ${svc.tunnelId}`, 15000);
   if (tunnelResult.stdout.includes('does not have any active connection')) return 'fail';
   if (tunnelResult.stdout.includes('CONNECTOR')) return 'ok';
@@ -174,7 +234,14 @@ async function repairGateway() {
   return await checkGateway();
 }
 
-async function repairPm2(name, port) {
+function getEcosystemForService(serviceName) {
+  const svc = config.services[serviceName];
+  const ecoLabel = svc?.ecosystem;
+  if (!ecoLabel || !config.ecosystems?.[ecoLabel]) return null;
+  return config.ecosystems[ecoLabel];
+}
+
+async function repairPm2(name, port, serviceName) {
   // Kill zombie on port
   if (port) {
     const netstat = await run(`netstat -ano | findstr ":${port}.*LISTENING"`, 5000);
@@ -188,20 +255,35 @@ async function repairPm2(name, port) {
       }
     }
   }
+
+  // Try pm2 restart first
   log('REPAIR', `${name}: pm2 restart...`);
-  await pm2Run(`restart ${name}`);
+  const restartResult = await pm2Run(`restart ${name}`);
+
+  if (!restartResult.ok || restartResult.stderr.includes('not found')) {
+    // Fallback: start via ecosystem file
+    const ecoPath = getEcosystemForService(serviceName);
+    if (ecoPath && existsSync(ecoPath)) {
+      log('REPAIR', `${name}: not in pm2, starting via ecosystem (${ecoPath})...`);
+      const ecoCwd = dirname(ecoPath);
+      await run(`npx pm2 start "${ecoPath}" --only ${name}`, 30000, ecoCwd);
+    } else {
+      log('REPAIR', `${name}: no ecosystem path configured, cannot recover`);
+    }
+  }
+
   await sleep(3000);
 }
 
 async function repairKakaotalk() {
   const svc = config.services.kakaotalk;
-  await repairPm2(svc.pm2Name, svc.port);
+  await repairPm2(svc.pm2Name, svc.port, 'kakaotalk');
   return await checkKakaotalk();
 }
 
 async function repairBridge() {
   const svc = config.services.bridge;
-  await repairPm2(svc.pm2Name, svc.port);
+  await repairPm2(svc.pm2Name, svc.port, 'bridge');
   return await checkBridge();
 }
 
@@ -218,14 +300,12 @@ async function escalateToCheckScript() {
   const esc = config.escalation;
   if (!esc?.enabled) return false;
 
-  // Cooldown check
   const cooldownMs = (esc.cooldown || 300) * 1000;
   if (lastEscalation && (Date.now() - lastEscalation) < cooldownMs) {
     log('ESCAL', `Cooldown active (${Math.ceil((cooldownMs - (Date.now() - lastEscalation)) / 1000)}s left)`);
     return false;
   }
 
-  // Max retries check
   if (escalationCount >= (esc.maxRetries || 2)) {
     log('ESCAL', `Max retries (${esc.maxRetries || 2}) reached, skipping`);
     return false;
@@ -253,7 +333,6 @@ async function escalateToCheckScript() {
 async function runChecks() {
   const results = {};
 
-  // Run checks in parallel
   const [gw, kt, br, cf] = await Promise.all([
     checkGateway(),
     checkKakaotalk(),
@@ -268,14 +347,11 @@ async function runChecks() {
 
   let needsEscalation = false;
 
-  // Detect state transitions + repair + notify
   for (const [name, newStatus] of Object.entries(results)) {
     if (newStatus === 'disabled') continue;
     const prev = state[name].status;
-    const transitioned = prev !== newStatus && prev !== 'unknown';
 
     if (newStatus === 'fail') {
-      // Try auto-repair
       if (config.autoRepair) {
         let repaired = 'fail';
         switch (name) {
@@ -294,7 +370,6 @@ async function runChecks() {
           continue;
         }
       }
-      // Still failed after basic repair → flag for escalation
       state[name].status = 'fail';
       state[name].lastFail = Date.now();
       needsEscalation = true;
@@ -309,11 +384,9 @@ async function runChecks() {
     }
   }
 
-  // Escalation: basic repair failed → try openclaw-check.sh --repair
   if (needsEscalation) {
     const escalated = await escalateToCheckScript();
     if (escalated) {
-      // Escalation succeeded → recheck all services
       const [gw2, kt2, br2, cf2] = await Promise.all([
         checkGateway(), checkKakaotalk(), checkBridge(), checkCloudflared()
       ]);
@@ -327,7 +400,6 @@ async function runChecks() {
         }
       }
     } else {
-      // Escalation also failed → CRITICAL alert
       const failedServices = Object.entries(results)
         .filter(([_, s]) => s === 'fail')
         .map(([n]) => n);
@@ -338,7 +410,6 @@ async function runChecks() {
     }
   }
 
-  // All OK → reset escalation counter
   const allOk = Object.values(results).every(s => s === 'ok' || s === 'disabled');
   if (allOk) escalationCount = 0;
 
@@ -379,7 +450,6 @@ async function cmdCheck() {
   console.log('');
   log('RESULT', formatSummary(results));
 
-  // Detailed output
   console.log('');
   console.log('--- Route Status ---');
   const gwOk = results.gateway === 'ok';
@@ -418,6 +488,39 @@ async function cmdCheck() {
   process.exit(allOk ? 0 : 1);
 }
 
+async function cmdWatchdog() {
+  // schtasks용 1회 실행 모드: PM2 독립, 상태 파일 기반
+  loadState();
+
+  // Step 1: PM2 데몬 생존 확인
+  const pm2Alive = await checkPm2Daemon();
+  if (!pm2Alive) {
+    log('RESCUE', 'PM2 daemon is not responding');
+    await notify('OpenClaw RESCUE', 'PM2 daemon dead - bootstrapping all services');
+    await bootstrapPm2();
+  } else {
+    // PM2 살아있지만 프로세스 목록이 비었는지 확인
+    const jlistResult = await pm2Run('jlist');
+    let procCount = 0;
+    try {
+      const procs = JSON.parse(jlistResult.stdout);
+      procCount = procs.length;
+    } catch {}
+    if (procCount === 0) {
+      log('RESCUE', 'PM2 alive but process list empty - bootstrapping...');
+      await notify('OpenClaw RESCUE', 'PM2 process list empty - re-registering all services');
+      await bootstrapPm2();
+    }
+  }
+
+  // Step 2: 일반 서비스 점검 + 복구
+  const results = await runChecks();
+  log('STATUS', `${formatSummary(results)} | mode: watchdog`);
+
+  // Step 3: 상태 저장
+  saveState();
+}
+
 async function cmdDaemon() {
   const interval = (config.interval || 60) * 1000;
   log('DAEMON', `Starting monitoring (interval: ${config.interval}s, repair: ${config.autoRepair})`);
@@ -425,11 +528,9 @@ async function cmdDaemon() {
   log('DAEMON', `Notifications - toast: ${config.notification?.toast?.enabled}, ntfy: ${config.notification?.ntfy?.enabled} (${config.notification?.ntfy?.topic})`);
   console.log('');
 
-  // Initial check
   const results = await runChecks();
   log('STATUS', `${formatSummary(results)} | next: ${config.interval}s`);
 
-  // Loop
   setInterval(async () => {
     try {
       const results = await runChecks();
@@ -440,50 +541,26 @@ async function cmdDaemon() {
   }, interval);
 }
 
-async function cmdStart() {
-  log('START', 'Starting openclaw-monitor via pm2...');
-  const ecosystemPath = join(__dirname, 'ecosystem.config.cjs');
-  const result = await pm2Run(`start "${ecosystemPath}"`, 30000);
-  if (result.ok) {
-    console.log(result.stdout);
-    log('START', 'Monitor daemon started');
-  } else {
-    console.error(result.stderr);
-    log('ERROR', 'Failed to start monitor daemon');
-  }
-}
-
-async function cmdStop() {
-  log('STOP', 'Stopping openclaw-monitor...');
-  const result = await pm2Run('stop openclaw-monitor', 15000);
-  if (result.ok) {
-    console.log(result.stdout);
-    log('STOP', 'Monitor daemon stopped');
-  } else {
-    console.error(result.stderr);
-  }
-}
-
 async function cmdStatus() {
-  const result = await pm2Run('jlist', 15000);
-  if (!result.ok) {
-    log('ERROR', 'Cannot read pm2 status');
-    return;
+  // schtasks 기반으로 전환됨
+  const result = await run('schtasks /Query /TN "OpenClaw-Monitor" /FO LIST', 10000);
+  if (result.ok) {
+    console.log('=== Scheduled Task: OpenClaw-Monitor ===');
+    console.log(result.stdout);
+  } else {
+    console.log('OpenClaw-Monitor: not registered as scheduled task');
   }
-  try {
-    const procs = JSON.parse(result.stdout);
-    const mon = procs.find(p => p.name === 'openclaw-monitor');
-    if (mon) {
-      const status = mon.pm2_env?.status || 'unknown';
-      const uptime = mon.pm2_env?.pm_uptime;
-      const restarts = mon.pm2_env?.restart_time || 0;
-      const uptimeStr = uptime ? `${Math.floor((Date.now() - uptime) / 60000)}m` : '?';
-      console.log(`openclaw-monitor: ${status} (uptime: ${uptimeStr}, restarts: ${restarts})`);
-    } else {
-      console.log('openclaw-monitor: not registered in pm2');
+
+  // 상태 파일 확인
+  if (existsSync(STATE_FILE)) {
+    const saved = JSON.parse(readFileSync(STATE_FILE, 'utf-8'));
+    const ago = saved.updatedAt ? `${Math.floor((Date.now() - saved.updatedAt) / 1000)}s ago` : 'unknown';
+    console.log(`\n=== Last watchdog run: ${ago} ===`);
+    for (const [name, s] of Object.entries(saved.services || {})) {
+      console.log(`  ${name}: ${s.status}`);
     }
-  } catch {
-    log('ERROR', 'Failed to parse pm2 output');
+  } else {
+    console.log('\nNo state file found (watchdog has not run yet)');
   }
 }
 
@@ -491,17 +568,15 @@ async function cmdStatus() {
 const cmd = process.argv[2] || 'check';
 
 switch (cmd) {
-  case 'check':  await cmdCheck(); break;
-  case 'daemon': await cmdDaemon(); break;
-  case 'start':  await cmdStart(); break;
-  case 'stop':   await cmdStop(); break;
-  case 'status': await cmdStatus(); break;
+  case 'check':    await cmdCheck(); break;
+  case 'watchdog': await cmdWatchdog(); break;
+  case 'daemon':   await cmdDaemon(); break;
+  case 'status':   await cmdStatus(); break;
   default:
-    console.log('Usage: node openclaw-monitor.mjs [check|start|stop|status|daemon]');
-    console.log('  check  - One-shot health check (default)');
-    console.log('  start  - Start daemon via pm2');
-    console.log('  stop   - Stop daemon');
-    console.log('  status - Show daemon status');
-    console.log('  daemon - Run as foreground daemon (used by pm2)');
+    console.log('Usage: node openclaw-monitor.mjs [check|watchdog|daemon|status]');
+    console.log('  check    - One-shot health check (default)');
+    console.log('  watchdog - Single run: check + repair + save state (for schtasks)');
+    console.log('  daemon   - Run as foreground daemon (legacy pm2 mode)');
+    console.log('  status   - Show scheduled task & last state');
     process.exit(0);
 }
