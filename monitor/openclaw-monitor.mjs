@@ -228,10 +228,19 @@ async function checkCloudflared() {
 // === Repair ===
 
 async function repairGateway() {
-  log('REPAIR', 'Gateway: openclaw gateway start...');
-  await run('openclaw gateway start', 30000);
-  await sleep(3000);
-  return await checkGateway();
+  log('REPAIR', 'Gateway: triggering schtasks...');
+  const trigger = await run('schtasks /Run /TN "OpenClaw Gateway"', 10000);
+  if (!trigger.ok) {
+    log('REPAIR', `schtasks failed, falling back to CLI: ${trigger.stderr}`);
+    await run('openclaw gateway start', 30000);
+  }
+  // Gateway needs a few seconds to boot after schtasks trigger
+  for (let i = 0; i < 4; i++) {
+    await sleep(2000);
+    const status = await checkGateway();
+    if (status === 'ok') return 'ok';
+  }
+  return 'fail';
 }
 
 function getEcosystemForService(serviceName) {
