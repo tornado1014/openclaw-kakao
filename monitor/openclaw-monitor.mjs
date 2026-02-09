@@ -12,10 +12,10 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 // === Config ===
-function loadConfig() {
-  const localPath = join(__dirname, 'config.local.json');
-  const defaultPath = join(__dirname, 'config.json');
-  const examplePath = join(__dirname, 'config.example.json');
+function loadConfig(dir = __dirname) {
+  const localPath = join(dir, 'config.local.json');
+  const defaultPath = join(dir, 'config.json');
+  const examplePath = join(dir, 'config.example.json');
   const configPath = existsSync(localPath) ? localPath
     : existsSync(defaultPath) ? defaultPath
     : examplePath;
@@ -27,8 +27,19 @@ function loadConfig() {
   return JSON.parse(readFileSync(configPath, 'utf-8'));
 }
 
-const config = loadConfig();
-const PM2_CWD = join(__dirname, '..');
+let config = {};
+let PM2_CWD = join(__dirname, '..');
+
+/** @internal For testing: inject config and reset state */
+function _initForTest(testConfig) {
+  config = testConfig;
+  PM2_CWD = join(__dirname, '..');
+  Object.keys(state).forEach(k => {
+    state[k] = { status: 'unknown', lastFail: null, lastNotify: null };
+  });
+  lastEscalation = null;
+  escalationCount = 0;
+}
 const STATE_FILE = join(__dirname, 'monitor-state.json');
 
 // === Persistent State (file-based for watchdog mode) ===
@@ -573,19 +584,36 @@ async function cmdStatus() {
   }
 }
 
-// === Main ===
-const cmd = process.argv[2] || 'check';
+// === Exports (for testing) ===
+export {
+  _initForTest, loadConfig,
+  shouldNotify, statusIcon, formatSummary,
+  checkGateway, checkPm2Process, checkBridge, checkCloudflared,
+  repairGateway, escalateToCheckScript, runChecks,
+  state, log, sleep
+};
 
-switch (cmd) {
-  case 'check':    await cmdCheck(); break;
-  case 'watchdog': await cmdWatchdog(); break;
-  case 'daemon':   await cmdDaemon(); break;
-  case 'status':   await cmdStatus(); break;
-  default:
-    console.log('Usage: node openclaw-monitor.mjs [check|watchdog|daemon|status]');
-    console.log('  check    - One-shot health check (default)');
-    console.log('  watchdog - Single run: check + repair + save state (for schtasks)');
-    console.log('  daemon   - Run as foreground daemon (legacy pm2 mode)');
-    console.log('  status   - Show scheduled task & last state');
-    process.exit(0);
+// === Main ===
+const _isMain = process.argv[1] && (
+  fileURLToPath(import.meta.url).replace(/\\/g, '/') === process.argv[1].replace(/\\/g, '/')
+);
+
+if (_isMain) {
+  config = loadConfig();
+
+  const cmd = process.argv[2] || 'check';
+
+  switch (cmd) {
+    case 'check':    await cmdCheck(); break;
+    case 'watchdog': await cmdWatchdog(); break;
+    case 'daemon':   await cmdDaemon(); break;
+    case 'status':   await cmdStatus(); break;
+    default:
+      console.log('Usage: node openclaw-monitor.mjs [check|watchdog|daemon|status]');
+      console.log('  check    - One-shot health check (default)');
+      console.log('  watchdog - Single run: check + repair + save state (for schtasks)');
+      console.log('  daemon   - Run as foreground daemon (legacy pm2 mode)');
+      console.log('  status   - Show scheduled task & last state');
+      process.exit(0);
+  }
 }
