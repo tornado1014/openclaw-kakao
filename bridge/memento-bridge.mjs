@@ -1550,7 +1550,7 @@ server.on("error", (err) => {
         console.error(`Killing zombie PID ${pid} on port ${PORT}`);
         execSync(`taskkill /PID ${pid} /F`, { windowsHide: true, timeout: 5000 });
         setTimeout(() => {
-          server.listen(PORT, "127.0.0.1");
+          server.listen(PORT, "0.0.0.0");
         }, 2000);
         return;
       }
@@ -1562,7 +1562,7 @@ server.on("error", (err) => {
   throw err;
 });
 
-server.listen(PORT, "127.0.0.1", () => {
+server.listen(PORT, "0.0.0.0", () => {
   console.log(`memento-bridge listening on port ${PORT}`);
   console.log(`gateway: ${GATEWAY_URL}`);
   console.log(`image dir: ${IMAGE_DIR}`);
