@@ -17,7 +17,7 @@ import http from "http";
 import fs from "fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { execSync } from "node:child_process";
+import { execSync, execFileSync } from "node:child_process";
 import { stripMarkdown } from "./markdown-remover.mjs";
 
 // .env 파일 로드 (dotenv 없이 직접 로드)
@@ -99,6 +99,22 @@ const pendingImageResults = new Map(); // room -> { result, timestamp }
 const generations = new Map(); // key -> int
 
 // ============================================================
+// Rate Limiting (토큰 버킷)
+// ============================================================
+const rateLimits = new Map(); // IP → { tokens, lastRefill }
+function checkRateLimit(ip, maxPerMinute = 30) {
+  const now = Date.now();
+  let bucket = rateLimits.get(ip);
+  if (!bucket || now - bucket.lastRefill > 60000) {
+    bucket = { tokens: maxPerMinute, lastRefill: now };
+  }
+  if (bucket.tokens <= 0) return false;
+  bucket.tokens--;
+  rateLimits.set(ip, bucket);
+  return true;
+}
+
+// ============================================================
 // 보안: 개인정보 보호 (출력 필터 + 인젝션 탐지)
 // ============================================================
 
@@ -127,18 +143,21 @@ function logSecurityEvent(event) {
   console.error(`[SECURITY:${event.severity}] ${event.type}: ${event.action}`);
 }
 
-// 개인정보 패턴 (그룹채팅 응답에서 차단)
-const PRIVATE_PATTERNS = [
-  /이현찬/g,
-  /남연/g,
-  /소윤/g,
-  /해든/g,
-  /2019년생/g,
-  /2023년생/g,
-  /성인\s*ADHD/gi,
-  /어린이집\s*교사/g,
-  /USER-PRIVATE\.md/gi,
-];
+// 개인정보 패턴 (그룹채팅 응답에서 차단) - 외부 파일에서 로드
+const PRIVATE_PATTERNS = (() => {
+  const patternsFile = path.join(__dirname, "private-patterns.local.json");
+  try {
+    if (fs.existsSync(patternsFile)) {
+      const data = JSON.parse(fs.readFileSync(patternsFile, "utf8"));
+      return (data.patterns || []).map(p => new RegExp(p, "gi"));
+    }
+  } catch (e) {
+    console.error(`[security] Failed to load private patterns: ${e.message}`);
+  }
+  // 폴백: 파일 없으면 빈 배열 (안전 모드)
+  console.warn("[security] private-patterns.local.json not found, no patterns loaded");
+  return [];
+})();
 
 function sanitizeOutput(text, isGroupChat, room, sender) {
   if (!isGroupChat || !text) return text;
@@ -398,9 +417,9 @@ let _adbDevice = null;
 
 function detectAdbDevice() {
   if (_adbDevice) return _adbDevice;
-  const adbPath = fs.existsSync(ADB_PATH) ? `"${ADB_PATH}"` : "adb";
+  const adbPath = fs.existsSync(ADB_PATH) ? ADB_PATH : "adb";
   try {
-    const out = execSync(`${adbPath} devices`, { encoding: "utf8", timeout: 10000, stdio: ['pipe', 'pipe', 'pipe'] });
+    const out = execFileSync(adbPath, ["devices"], { encoding: "utf8", timeout: 10000, stdio: ['pipe', 'pipe', 'pipe'] });
     const lines = out.split("\n").filter(l => l.includes("\tdevice"));
     if (lines.length > 0) {
       _adbDevice = lines[0].split("\t")[0].trim();
@@ -413,20 +432,27 @@ function detectAdbDevice() {
 }
 
 function adbExec(args) {
-  const adbPath = fs.existsSync(ADB_PATH) ? `"${ADB_PATH}"` : "adb";
+  const adbPath = fs.existsSync(ADB_PATH) ? ADB_PATH : "adb";
   const device = detectAdbDevice();
-  const deviceFlag = device ? `-s ${device}` : "";
-  const cmd = `${adbPath} ${deviceFlag} ${args}`;
-  console.log(`[adb] Running: ${cmd}`);
+  const cmdArgs = [];
+  if (device) cmdArgs.push("-s", device);
+  // args가 문자열이면 쉘 명령 (shell 서브커맨드), 배열이면 직접 전달
+  if (typeof args === 'string') {
+    cmdArgs.push(...args.split(/\s+/));
+  } else {
+    cmdArgs.push(...args);
+  }
+  console.log(`[adb] Running: ${adbPath} ${cmdArgs.join(' ')}`);
   try {
-    const result = execSync(cmd, { encoding: "utf8", timeout: 30000, stdio: ['pipe', 'pipe', 'pipe'] });
+    const result = execFileSync(adbPath, cmdArgs, {
+      encoding: "utf8", timeout: 30000, stdio: ['pipe', 'pipe', 'pipe']
+    });
     console.log(`[adb] Result length: ${result.length}, content: "${result.trim().substring(0, 300)}"`);
     return result;
   } catch (e) {
     console.error(`[adb] Command failed: ${e.message}`);
     if (e.stdout) console.error(`[adb] stdout: ${e.stdout}`);
     if (e.stderr) console.error(`[adb] stderr: ${e.stderr}`);
-    // 장치 캐시 초기화 (다음 시도에서 재감지)
     _adbDevice = null;
     return null;
   }
@@ -529,7 +555,7 @@ async function analyzeImageWithGemini(imageBase64, prompt) {
     if (match) pureBase64 = match[1];
   }
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 
   const payload = {
     contents: [{
@@ -551,7 +577,7 @@ async function analyzeImageWithGemini(imageBase64, prompt) {
 
   const response = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY },
     body: JSON.stringify(payload)
   });
 
@@ -750,7 +776,7 @@ const server = http.createServer(async (req, res) => {
         "Content-Type": contentType,
         "Content-Length": stats.size,
         "Cache-Control": "public, max-age=3600",
-        "Access-Control-Allow-Origin": "*"
+        "Access-Control-Allow-Origin": "https://images.earendel.blog"
       });
       fs.createReadStream(imagePath).pipe(res);
     } catch (e) {
@@ -759,6 +785,15 @@ const server = http.createServer(async (req, res) => {
       return res.end("Internal server error");
     }
     return;
+  }
+
+  // Rate limiting for webhook endpoints
+  const clientIp = req.socket.remoteAddress || "unknown";
+  if (req.method === "POST" && ["/webhook/memento", "/webhook/image", "/webhook/url-summary", "/trigger-image"].includes(req.url)) {
+    if (!checkRateLimit(clientIp)) {
+      res.writeHead(429, { "Content-Type": "application/json; charset=utf-8" });
+      return res.end(JSON.stringify({ ok: false, error: "Rate limit exceeded" }));
+    }
   }
 
   // POST /webhook/image - ADB 이미지 모니터에서 이미지 수신
@@ -1515,7 +1550,7 @@ server.on("error", (err) => {
         console.error(`Killing zombie PID ${pid} on port ${PORT}`);
         execSync(`taskkill /PID ${pid} /F`, { windowsHide: true, timeout: 5000 });
         setTimeout(() => {
-          server.listen(PORT, "0.0.0.0");
+          server.listen(PORT, "127.0.0.1");
         }, 2000);
         return;
       }
@@ -1527,7 +1562,7 @@ server.on("error", (err) => {
   throw err;
 });
 
-server.listen(PORT, "0.0.0.0", () => {
+server.listen(PORT, "127.0.0.1", () => {
   console.log(`memento-bridge listening on port ${PORT}`);
   console.log(`gateway: ${GATEWAY_URL}`);
   console.log(`image dir: ${IMAGE_DIR}`);

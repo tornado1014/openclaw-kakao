@@ -5,7 +5,7 @@
     "ntfy": {
       "enabled": true,
       "server": "https://ntfy.sh",
-      "topic": "ccwn-noti-momento",
+      "topic": "YOUR_NTFY_TOPIC",
       "priority": "high",
       "tags": ["warning", "server"]
     },
@@ -23,6 +23,6 @@
     "gateway": { "enabled": true, "port": 25382 },
     "kakaotalk": { "enabled": true, "port": 3000, "pm2Name": "clawdbot-kakaotalk" },
     "bridge": { "enabled": true, "port": 8787, "pm2Name": "memento-bridge", "pingUrl": "http://localhost:8787/ping" },
-    "cloudflared": { "enabled": true, "tunnelId": "f87ba098-9e14-4e72-b21a-67468ed822c5" }
+    "cloudflared": { "enabled": true, "tunnelId": "YOUR_TUNNEL_ID" }
   }
 }

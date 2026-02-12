@@ -58,6 +58,13 @@ monitor/config.local.json
 monitor/monitor-state.json
 monitor/logs/
 
+# Security - sensitive configs
+monitor/config.json
+agents/*/agent/auth-profiles.json
+bridge/private-patterns.local.json
+*.pem
+*.key
+
 # Misc
 *.tmp
 *.temp

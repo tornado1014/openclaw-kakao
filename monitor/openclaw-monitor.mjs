@@ -3,7 +3,7 @@
 // Usage: node openclaw-monitor.mjs [check|watchdog|daemon|status]
 // watchdog: schtasks용 1회 실행 모드 (PM2 독립, 상태 파일 기반)
 
-import { exec, execSync } from 'child_process';
+import { exec, execSync, execFile } from 'child_process';
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
@@ -128,11 +128,17 @@ async function bootstrapPm2() {
 async function sendToast(title, message) {
   if (!config.notification?.toast?.enabled) return;
   const silent = config.notification.toast.silent;
-  const safeTitle = title.replace(/'/g, "''");
-  const safeMsg = message.replace(/'/g, "''");
-  const silentFlag = silent ? ' -Silent' : '';
-  const ps = `Import-Module BurntToast; New-BurntToastNotification -AppLogo $null -Text '${safeTitle}','${safeMsg}'${silentFlag}`;
-  await run(`powershell -NoProfile -Command "${ps}"`, 10000);
+  const silentParam = silent ? ' -Silent' : '';
+  return new Promise((resolve) => {
+    execFile('powershell', [
+      '-NoProfile', '-Command',
+      `Import-Module BurntToast; New-BurntToastNotification -AppLogo $null -Text $args[0],$args[1]${silentParam}`,
+      title, message
+    ], { windowsHide: true, timeout: 10000 }, (err) => {
+      if (err) log('TOAST', `Failed: ${err.message}`);
+      resolve();
+    });
+  });
 }
 
 async function sendNtfy(title, message) {
@@ -332,6 +338,18 @@ async function escalateToCheckScript() {
   }
 
   const scriptPath = esc.scriptPath;
+
+  // 보안: 스크립트 경로 화이트리스트 검증
+  const ALLOWED_SCRIPT_DIRS = [
+    '/c/Users/user/.claude/skills/',
+    'C:/Users/user/.claude/skills/',
+    'C:\\Users\\user\\.claude\\skills\\'
+  ];
+  if (!ALLOWED_SCRIPT_DIRS.some(dir => scriptPath.startsWith(dir))) {
+    log('ESCAL', `BLOCKED: unauthorized script path: ${scriptPath}`);
+    return false;
+  }
+
   log('ESCAL', `Running check script: ${scriptPath} --repair`);
   lastEscalation = Date.now();
   escalationCount++;
